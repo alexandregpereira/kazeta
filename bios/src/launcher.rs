@@ -28,6 +28,8 @@ pub const INTRO_ARG: &str = "--intro";
 /// How much of the cart is read into the page cache while the intro plays
 const PRELOAD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const PRELOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
+/// Files up to this size (executables, libraries, engine data) are read before the larger ones
+const PRELOAD_SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const PLAYTIME_INTERVAL: Duration = Duration::from_secs(60);
 /// How long gamescope gets to exit after a termination signal before it is killed
 const GAMESCOPE_KILL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -270,13 +272,17 @@ fn cart_files(dir: &Path, files: &mut Vec<(u64, PathBuf)>) {
     }
 }
 
-/// Order in which the preload reads a cart: files named in Exec first (following a
-/// leading `cd <dir>`), then the largest files
+/// Order in which the preload reads a cart:
+/// 1. small files named in Exec (following a leading `cd <dir>`), usually the game executable
+/// 2. other small files, which hold what games read when they start (executables, libraries,
+///    engine data), shallowest first since content packs tend to be nested deeper
+/// 3. large files named in Exec, such as a disc image passed to an emulator
+/// 4. other large files, smallest first
 fn preload_order(cart_path: &Path, cart_exec: &str) -> Vec<PathBuf> {
     let cart_path = &fs::canonicalize(cart_path).unwrap_or_else(|_| cart_path.to_path_buf());
-    let mut order = Vec::new();
+    let mut exec_files: Vec<PathBuf> = Vec::new();
     let mut exec_dir = cart_path.to_path_buf();
-    let mut words = exec_words(cart_exec).into_iter().peekable();
+    let mut words = exec_words(cart_exec).into_iter();
     while let Some(word) = words.next() {
         if word == "cd" {
             if let Some(dir) = words.next() {
@@ -286,8 +292,8 @@ fn preload_order(cart_path: &Path, cart_exec: &str) -> Vec<PathBuf> {
         }
         for path in [exec_dir.join(&word), cart_path.join(&word)] {
             if let Ok(path) = fs::canonicalize(&path) {
-                if path.starts_with(cart_path) && path.is_file() && !order.contains(&path) {
-                    order.push(path);
+                if path.starts_with(cart_path) && path.is_file() && !exec_files.contains(&path) {
+                    exec_files.push(path);
                 }
             }
         }
@@ -295,13 +301,27 @@ fn preload_order(cart_path: &Path, cart_exec: &str) -> Vec<PathBuf> {
 
     let mut files = Vec::new();
     cart_files(cart_path, &mut files);
-    files.sort_by(|a, b| b.0.cmp(&a.0));
-    let rest: Vec<PathBuf> = files.into_iter()
-        .map(|(_, path)| path)
-        .filter(|path| fs::canonicalize(path).map_or(true, |path| !order.contains(&path)))
-        .collect();
-    order.extend(rest);
-    order
+    let class = |size: u64, path: &Path| {
+        let in_exec = exec_files.iter().position(|exec| exec == path);
+        let small = size <= PRELOAD_SMALL_FILE_BYTES;
+        match (small, in_exec) {
+            (true, Some(index)) => (0, index),
+            (true, None) => (1, 0),
+            (false, Some(index)) => (2, index),
+            (false, None) => (3, 0),
+        }
+    };
+    let depth = |path: &Path| path.components().count();
+    files.sort_by(|a, b| {
+        class(a.0, &a.1).cmp(&class(b.0, &b.1)).then_with(|| {
+            if a.0 <= PRELOAD_SMALL_FILE_BYTES {
+                depth(&a.1).cmp(&depth(&b.1)).then_with(|| a.1.cmp(&b.1))
+            } else {
+                a.0.cmp(&b.0)
+            }
+        })
+    });
+    files.into_iter().map(|(_, path)| path).collect()
 }
 
 /// Read up to PRELOAD_MAX_BYTES of the cart so the game finds it in the page cache
