@@ -49,7 +49,45 @@ function stop_playtime_capture {
 	done
 }
 
+# read the cart ahead of time while the intro plays, so the game finds its
+# files in the page cache; signals the intro that it may end when done
+PRELOAD_MAX_MB=1024
+INTRO_READY_FILE=/tmp/kazeta-intro-ready
+
+function preload_cart {
+	local budget=$((PRELOAD_MAX_MB * 1024 * 1024))
+	local exec_files=()
+	local token
+	while IFS= read -r token; do
+		if [[ -f "${cart_path}/${token}" ]]; then
+			exec_files+=("${cart_path}/${token}")
+		fi
+	done < <(printf '%s' "${cart_exec}" | xargs -n1 printf '%s\n' 2> /dev/null)
+
+	{
+		for f in "${exec_files[@]}"; do
+			echo "${f}"
+		done
+		find "${cart_path}" -type f -printf '%s %p\n' | sort -rn | cut -d' ' -f2-
+	} | while IFS= read -r f && [[ ${budget} -gt 0 ]]; do
+		size=$(stat -c %s "${f}" 2> /dev/null || echo 0)
+		head -c "${budget}" "${f}" > /dev/null 2>&1
+		budget=$((budget - size))
+	done
+
+	touch "${INTRO_READY_FILE}"
+}
+
+function stop_preload {
+	if [[ -n "${preload_pid}" ]]; then
+		kill -- -"${preload_pid}" 2> /dev/null
+		preload_pid=""
+	fi
+	rm -f "${INTRO_READY_FILE}"
+}
+
 function cleanup {
+	stop_preload
 	stop_playtime_capture
 	rm -f .local/share/gvfs-metadata
 	popd
@@ -86,6 +124,11 @@ if [[ ! -f "${cart_info}" ]] && [[ ! -f "${cart_pkg}" ]]; then
 	gamescope ${RESOLUTION_OPTS} --filter pixel -- kazeta-bios
 	exit 0
 fi
+
+# boot intro, runs while the cart is mounted and preloaded
+rm -f "${INTRO_READY_FILE}"
+gamescope ${RESOLUTION_OPTS} --filter pixel -- kazeta-bios --intro --ready-file "${INTRO_READY_FILE}" &
+intro_pid=$!
 
 if [[ -f "${cart_pkg}" ]]; then
 	cart_path="${BASE_DIR}/run/pkg"
@@ -140,12 +183,19 @@ runtimedir="${BASE_DIR}/run/runtime"
 pkexec kazeta-mount "${lower}" "${upper}" "${work}" "${target}" "${runtime}" "${runtimedir}"
 trap cleanup EXIT
 
+cart_exec="$(get_attribute 'Exec' ${cart_info})"
+# job control gives the preload its own process group, so it can be stopped
+# together with the reads it spawned
+set -m
+preload_cart &
+preload_pid=$!
+set +m
+
 # home directory for the game, only applied to the game's environment below
 cart_home="${target}"
 
 pushd "${cart_home}"
 
-cart_exec="$(get_attribute 'Exec' ${cart_info})"
 cart_gsopts="$(get_attribute 'GamescopeOptions' ${cart_info})"
 if [ -z "${cart_gsopts}" ]; then
 	cart_gsopts="${RESOLUTION_OPTS}"
@@ -161,6 +211,10 @@ rm -f .kazeta/var/playtime_end
 
 mkdir -p .kazeta/var
 date --iso-8601=seconds > .kazeta/var/playtime_start
+# the intro ends once the preload is done or after its maximum time
+wait "${intro_pid}"
+stop_preload
+
 start_playtime_capture &
 env HOME="${cart_home}" \
 	XDG_CONFIG_HOME="${cart_home}/.config" \

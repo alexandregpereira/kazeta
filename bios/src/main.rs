@@ -1307,8 +1307,121 @@ fn render_display_menu(
     }
 }
 
+// Boot intro shown while a cart is being prepared
+const INTRO_BLACK: f64 = 0.4; // black screen before the logo
+const INTRO_ENTER: f64 = 1.0; // logo fade-in and zoom
+const INTRO_MIN: f64 = 3.0; // minimum time before the intro may end
+const INTRO_MAX: f64 = 12.0; // give up waiting for the ready file after this
+const INTRO_EXIT: f64 = 0.8; // fade to black
+const INTRO_READY_FILE: &str = "/tmp/kazeta-intro-ready";
+const INTRO_READY_POLL: f64 = 0.1;
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
+async fn run_intro(ready_file: std::path::PathBuf) {
+    let logo = Texture2D::from_file_with_format(include_bytes!("../logo.png"), Some(ImageFormat::Png));
+    logo.set_filter(FilterMode::Nearest);
+    let boot_sound = audio::load_sound_from_bytes(include_bytes!("../boot.wav")).await.unwrap();
+
+    let color_targets: [Color; 6] = [
+        Color { r: 1.0, g: 0.5, b: 0.5, a: 1.0 },
+        Color { r: 1.0, g: 1.0, b: 0.5, a: 1.0 },
+        Color { r: 0.5, g: 1.0, b: 0.5, a: 1.0 },
+        Color { r: 0.5, g: 1.0, b: 1.0, a: 1.0 },
+        Color { r: 0.5, g: 0.5, b: 1.0, a: 1.0 },
+        Color { r: 1.0, g: 0.5, b: 1.0, a: 1.0 },
+    ];
+    const COLOR_STEP: f64 = 0.6; // seconds between color targets
+
+    let start = get_time();
+    let mut sound_played = false;
+    let mut exit_start: Option<f64> = None;
+    let mut last_poll = -INTRO_READY_POLL;
+    let mut ready = false;
+
+    loop {
+        let elapsed = get_time() - start;
+        clear_background(BLACK);
+
+        if elapsed >= INTRO_BLACK {
+            if !sound_played {
+                audio::play_sound(&boot_sound, audio::PlaySoundParams { looped: false, volume: 1.0 });
+                sound_played = true;
+            }
+
+            let enter = ((elapsed - INTRO_BLACK) / INTRO_ENTER).min(1.0) as f32;
+            let eased = 1.0 - (1.0 - enter).powi(3);
+            let scale = 0.6 + 0.4 * eased;
+
+            // white during the entrance, then slowly cycle through the bios colors
+            let hold = (elapsed - INTRO_BLACK - INTRO_ENTER).max(0.0) / COLOR_STEP;
+            let index = hold as usize;
+            let mut color = if hold <= 0.0 {
+                WHITE
+            } else if index == 0 {
+                lerp_color(WHITE, color_targets[0], hold as f32)
+            } else {
+                lerp_color(
+                    color_targets[(index - 1) % color_targets.len()],
+                    color_targets[index % color_targets.len()],
+                    hold.fract() as f32,
+                )
+            };
+            color.a = eased;
+
+            let w = (logo.width() * scale).round();
+            let h = (logo.height() * scale).round();
+            let x = ((SCREEN_WIDTH as f32 - w) / 2.0).round();
+            let y = ((SCREEN_HEIGHT as f32 - h) / 2.0).round();
+            draw_texture_ex(&logo, x, y, color, DrawTextureParams {
+                dest_size: Some(Vec2 { x: w, y: h }),
+                ..Default::default()
+            });
+        }
+
+        if exit_start.is_none() {
+            if !ready && elapsed - last_poll >= INTRO_READY_POLL {
+                ready = ready_file.exists();
+                last_poll = elapsed;
+            }
+            if elapsed >= INTRO_MIN && (ready || elapsed >= INTRO_MAX) {
+                exit_start = Some(elapsed);
+            }
+        }
+
+        if let Some(exit_time) = exit_start {
+            let progress = ((elapsed - exit_time) / INTRO_EXIT).min(1.0) as f32;
+            draw_rectangle(0.0, 0.0, SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32,
+                Color { r: 0.0, g: 0.0, b: 0.0, a: progress });
+            if progress >= 1.0 {
+                return;
+            }
+        }
+
+        next_frame().await
+    }
+}
+
 #[macroquad::main(window_conf)]
 async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--intro") {
+        let ready_file = args.iter()
+            .position(|a| a == "--ready-file")
+            .and_then(|i| args.get(i + 1))
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from(INTRO_READY_FILE));
+        run_intro(ready_file).await;
+        process::exit(0);
+    }
+
     let mut dialogs: Vec<Dialog> = Vec::new();
     let mut dialog_state = DialogState::None;
     let font = load_ttf_font_from_bytes(include_bytes!("../november.ttf")).unwrap();
