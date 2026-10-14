@@ -7,7 +7,7 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -23,7 +23,7 @@ use crate::volume;
 const NONE_RUNTIME: &str = "/usr/share/kazeta/runtimes/none.kzr";
 /// Argument the launcher starts the bios UI with under gamescope
 pub const UI_ARG: &str = "--ui";
-/// Argument the launcher starts the boot intro with under gamescope
+/// Argument that plays the boot intro on its own, for previewing it
 pub const INTRO_ARG: &str = "--intro";
 /// How much of the cart is read into the page cache while the intro plays
 const PRELOAD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
@@ -162,8 +162,9 @@ fn pkexec_mount(args: &[&Path]) {
     }
 }
 
-/// Run the bios UI; `ignored_cart` is not started by it until it has been removed
-fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn Fn() -> bool) -> i32 {
+/// Run the bios UI; `ignored_cart` is not started by it until it has been removed.
+/// `on_cart` is called as soon as the UI hands over a cart, while it is still showing the intro.
+fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn Fn() -> bool, on_cart: &mut dyn FnMut(PathBuf)) -> i32 {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kazeta"));
     eprintln!("+ gamescope {:?} --filter pixel -- {} {} {:?}", resolution_args, exe.display(), UI_ARG, ignored_cart);
     let child = Command::new("gamescope")
@@ -176,6 +177,15 @@ fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn 
         .spawn();
     match child {
         Ok(mut child) => {
+            let boot_cart_file = boot_cart_file();
+            while matches!(child.try_wait(), Ok(None)) && !stop() {
+                let cart = fs::read_to_string(&boot_cart_file).unwrap_or_default();
+                if !cart.trim().is_empty() {
+                    on_cart(PathBuf::from(cart.trim()));
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
             let _ = signals::wait_child(&mut child, stop, GAMESCOPE_KILL_TIMEOUT);
             0
         }
@@ -314,69 +324,36 @@ fn preload_cart(order: Vec<PathBuf>, cancel: &AtomicBool) {
     eprintln!("Preloaded {} MB of the cart", (PRELOAD_MAX_BYTES - budget) / (1024 * 1024));
 }
 
-/// Boot intro shown under gamescope while a cart is mounted and preloaded. It plays for a
-/// minimum time and then waits for the ready file, which is created once the preload is done.
-struct Intro {
-    child: Option<Child>,
-    preload: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
-    ready_file: PathBuf,
+/// Reads the cart into the page cache in the background while the intro plays
+struct Preload {
+    cancel: Arc<AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
 }
 
-impl Intro {
-    fn start() -> Self {
-        let ready_file = intro_ready_file();
-        let _ = fs::remove_file(&ready_file);
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kazeta"));
-        eprintln!("+ gamescope --filter pixel -- {} {} {}", exe.display(), INTRO_ARG, ready_file.display());
-        let child = Command::new("gamescope")
-            .args(resolution_gamescope_args())
-            .args(orientation_gamescope_args())
-            .args(["--filter", "pixel", "--"])
-            .arg(exe)
-            .arg(INTRO_ARG)
-            .arg(&ready_file)
-            .spawn()
-            .map_err(|e| eprintln!("Failed to start intro: {}", e))
-            .ok();
-        Intro { child, preload: None, ready_file }
-    }
-
-    /// Start reading the mounted cart; the intro is told it may end once this is done
-    fn preload(&mut self, cart_path: &Path, cart_exec: &str) {
+impl Preload {
+    /// `ready_file` is created once the preload is done, so the intro may end
+    fn start(cart_path: &Path, cart_exec: &str, ready_file: &Path) -> Self {
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
         let cart_path = cart_path.to_path_buf();
         let cart_exec = cart_exec.to_string();
-        let ready_file = self.ready_file.clone();
+        let ready_file = ready_file.to_path_buf();
         let handle = thread::spawn(move || {
             preload_cart(preload_order(&cart_path, &cart_exec), &thread_cancel);
-            let _ = fs::File::create(&ready_file);
+            if !thread_cancel.load(Ordering::Relaxed) {
+                let _ = fs::File::create(&ready_file);
+            }
         });
-        self.preload = Some((cancel, handle));
-    }
-
-    /// Wait for the intro to end, then stop the preload so it does not compete with the game
-    fn finish(&mut self, stop: &dyn Fn() -> bool) {
-        if let Some(mut child) = self.child.take() {
-            let _ = signals::wait_child(&mut child, stop, GAMESCOPE_KILL_TIMEOUT);
-        }
-        if let Some((cancel, handle)) = self.preload.take() {
-            cancel.store(true, Ordering::Relaxed);
-            let _ = handle.join();
-        }
-        let _ = fs::remove_file(&self.ready_file);
+        Preload { cancel, handle: Some(handle) }
     }
 }
 
-impl Drop for Intro {
+impl Drop for Preload {
     fn drop(&mut self) {
-        // only left running when the launcher bails out before the game
-        if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        self.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
         }
-        self.child = None;
-        self.finish(&|| true);
     }
 }
 
@@ -467,12 +444,23 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         // a press that stopped the game must not also shut down from the bios
         power_key.clear();
 
-        // the bios waits for a cart and leaves its path behind when one should be launched
+        // the bios waits for a cart and leaves its path behind when one should be launched; it then
+        // plays the intro while the cart is mounted and preloaded here
         let boot_cart_file = boot_cart_file();
+        let ready_file = intro_ready_file();
         let _ = fs::remove_file(&boot_cart_file);
-        let status = run_bios(&resolution_gamescope_args(), last_cart.as_deref(), &stop);
+        let _ = fs::remove_file(&ready_file);
+        let mut prepared: Option<PreparedCart> = None;
+        let status = run_bios(&resolution_gamescope_args(), last_cart.as_deref(), &stop, &mut |cart| {
+            prepared = prepare_cart(cart, &base_dir, Some(&ready_file));
+            if prepared.is_none() {
+                // nothing to wait for, let the intro end
+                let _ = fs::File::create(&ready_file);
+            }
+        });
         let cart = fs::read_to_string(&boot_cart_file).ok().map(|path| PathBuf::from(path.trim()));
         let _ = fs::remove_file(&boot_cart_file);
+        let _ = fs::remove_file(&ready_file);
 
         if terminated.get() {
             return 1;
@@ -486,7 +474,11 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         };
 
         // a power button press stops the game and brings us back to the bios
-        let status = run_cart(cart.clone(), &base_dir, &stop);
+        let prepared = prepared.or_else(|| prepare_cart(cart.clone(), &base_dir, None));
+        let status = match prepared {
+            Some(prepared) if !stop() => play_cart(prepared, &stop),
+            _ => 1,
+        };
         eprintln!("Game exited with status {}", status);
         if terminated.get() {
             return 1;
@@ -500,10 +492,26 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
     if stop() {
         return 1;
     }
-    let is_pkg = cart.extension().is_some_and(|ext| ext == "kzp");
+    match prepare_cart(cart, base_dir, None) {
+        Some(prepared) if !stop() => play_cart(prepared, stop),
+        _ => 1,
+    }
+}
 
-    // shown while the cart is mounted and preloaded
-    let mut intro = Intro::start();
+/// A mounted cart, ready to run
+struct PreparedCart {
+    // declared first so it is stopped before the cart is unmounted
+    preload: Option<Preload>,
+    // unmounts the cart when dropped
+    _cleanup: CartCleanup,
+    cart_home: PathBuf,
+    cart_gsopts: Vec<String>,
+    cart_exec_file: PathBuf,
+}
+
+/// Mount a cart; with `ready_file`, also start preloading it, which creates the file when done
+fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Option<PreparedCart> {
+    let is_pkg = cart.extension().is_some_and(|ext| ext == "kzp");
 
     let mut cleanup = CartCleanup { pkg_mount: None, mounted: None, upper: None, cart_home: None };
 
@@ -514,7 +522,7 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
         cleanup.pkg_mount = Some(cart_path.clone());
         let Some(cart_info) = find_cart_file(&cart_path, "kzi") else {
             eprintln!("No cart info found in {}", cart_pkg.display());
-            return 1;
+            return None;
         };
         let media_path = cart_pkg.parent().unwrap_or(Path::new("/")).to_path_buf();
         (cart_info, cart_path, media_path)
@@ -555,13 +563,22 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
     cleanup.cart_home = Some(cart_home.clone());
 
     let cart_exec = attr("Exec");
-    intro.preload(&cart_path, &cart_exec);
+    let preload = ready_file.map(|ready_file| Preload::start(&cart_path, &cart_exec, ready_file));
     let cart_gsopts: Vec<String> = match attr("GamescopeOptions") {
         opts if opts.is_empty() => resolution_gamescope_args(),
         opts => opts.split_whitespace().map(String::from).collect(),
     };
     let cart_exec_file = cart_exec_file();
     let _ = fs::write(&cart_exec_file, format!("{}\n", cart_exec));
+
+    Some(PreparedCart { preload, _cleanup: cleanup, cart_home, cart_gsopts, cart_exec_file })
+}
+
+/// Run a prepared cart until the game exits or `stop` returns true, then unmount it
+fn play_cart(mut prepared: PreparedCart, stop: &dyn Fn() -> bool) -> i32 {
+    // the intro is over, the preload must not compete with the game
+    prepared.preload = None;
+    let cart_home = prepared.cart_home.clone();
 
     let var_dir = cart_home.join(".kazeta/var");
     let playtime_start = var_dir.join("playtime_start");
@@ -584,15 +601,12 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
 
     let _ = fs::create_dir_all(&var_dir);
     let _ = fs::write(&playtime_start, format!("{}\n", now_iso8601()));
-    intro.finish(stop);
-    drop(intro);
     let playtime = PlaytimeCapture::start(playtime_end);
 
-    // skip the game if we were asked to stop while mounting; cleanup still runs
-    let status = if stop() { 1 } else { run_game(&cart_home, &cart_gsopts, &cart_exec_file, stop) };
+    let status = run_game(&cart_home, &prepared.cart_gsopts, &prepared.cart_exec_file, stop);
 
     playtime.stop();
-    drop(cleanup);
+    drop(prepared);
 
     status
 }
