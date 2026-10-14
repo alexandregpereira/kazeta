@@ -1,0 +1,57 @@
+diff --git a/src/input/source/hidraw/dualsense.rs b/src/input/source/hidraw/dualsense.rs
+index 7b05c19..348c987 100644
+--- a/src/input/source/hidraw/dualsense.rs
++++ b/src/input/source/hidraw/dualsense.rs
+@@ -1,5 +1,5 @@
+ use std::fmt::Debug;
+-use std::time::Instant;
++use std::time::{Duration, Instant};
+ use std::{collections::HashMap, error::Error};
+ 
+ use evdev::{FFEffectData, FFEffectKind};
+@@ -93,6 +93,7 @@ impl DualSenseController {
+         // The value determines if the effect should be playing or not.
+         if value == 0 {
+             log::trace!("Stopping rumble");
++            self.haptic_timeout = None;
+             if let Err(e) = self.driver.rumble(0, 0) {
+                 log::debug!("Failed to stop rumble: {:?}", e);
+                 return Ok(());
+@@ -101,7 +102,6 @@ impl DualSenseController {
+         }
+ 
+         // Perform the rumble based on the effect
+-        // TODO: handle effect duration, etc.
+         match effect_data.kind {
+             FFEffectKind::Damper => (),
+             FFEffectKind::Inertia => (),
+@@ -128,15 +128,25 @@ impl DualSenseController {
+                 strong_magnitude,
+                 weak_magnitude,
+             } => {
+-                // Scale the rumble values to the DS5 values
+-                let left_speed = strong_magnitude / u8::MAX as u16 + 1;
+-                let right_speed = weak_magnitude / u8::MAX as u16 + 1;
++                // Scale the rumble values to the DS5 values, so a zero
++                // magnitude stops the motors
++                let left_speed = (strong_magnitude >> 8) as u8;
++                let right_speed = (weak_magnitude >> 8) as u8;
+ 
+                 // Do rumble
+-                if let Err(e) = self.driver.rumble(left_speed as u8, right_speed as u8) {
++                if let Err(e) = self.driver.rumble(left_speed, right_speed) {
+                     let err = format!("Failed to do rumble: {e:?}");
+                     return Err(err.into());
+                 }
++
++                // The controller keeps rumbling until told otherwise, so stop
++                // it once the effect length elapses (0 means infinite)
++                let length = effect_data.replay.length;
++                self.haptic_timeout = if length > 0 && (left_speed > 0 || right_speed > 0) {
++                    Some(Instant::now() + Duration::from_millis(length as u64))
++                } else {
++                    None
++                };
+             }
+         }
+ 

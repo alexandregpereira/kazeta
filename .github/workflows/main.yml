@@ -21,6 +21,7 @@ jobs:
     outputs:
       aur-pkgs: ${{ steps.set-aur-pkgs.outputs.matrix }}
       pkgs: ${{ steps.set-pkgs.outputs.matrix }}
+      pkgbuilds: ${{ steps.set-pkgbuilds.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
       - id: set-aur-pkgs
@@ -28,6 +29,9 @@ jobs:
         shell: bash
       - id: set-pkgs
         run: echo "matrix=$(ls -d pkgs/*/ | jq -R -s -c 'split("\n")[:-1]')" >> $GITHUB_OUTPUT
+        shell: bash
+      - id: set-pkgbuilds
+        run: echo "matrix=$(ls pkgbuilds/*/PKGBUILD | cut -d/ -f2 | jq -R -s -c 'split("\n")[:-1]')" >> $GITHUB_OUTPUT
         shell: bash
 
   aur-pkgbuild:
@@ -57,6 +61,35 @@ jobs:
             name: AUR-packages-${{ matrix.package }}
             path: aur-pkgs/*.pkg.tar*
 
+  pkgbuild:
+    needs:
+     - build-docker-image
+     - list-pkgbuilds
+    name: Build patched package
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        package: ${{ fromJson(needs.list-pkgbuilds.outputs.pkgbuilds) }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      - name: Build packages
+        run: |
+          docker pull ${{ steps.meta.outputs.tags }}
+          docker run --rm -v $(pwd):/workdir --entrypoint=/workdir/pkgbuilds/build-package.sh ${{ steps.meta.outputs.tags }} ${{ matrix.package }}
+      # installed with the AUR packages, after the repository packages, so it
+      # replaces the repository version
+      - name: Upload Package Archives
+        uses: actions/upload-artifact@v4
+        with:
+            name: AUR-packages-patched-${{ matrix.package }}
+            path: aur-pkgs/*.pkg.tar*
+
   build-bios-app:
     runs-on: ubuntu-latest
     steps:
@@ -83,6 +116,7 @@ jobs:
      - build-bios-app
      - build-docker-image
      - aur-pkgbuild
+     - pkgbuild
     name: Build OS UNSTABLE image
     uses: ./.github/workflows/build-system-image.yml
     with:
