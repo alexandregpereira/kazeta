@@ -1,0 +1,51 @@
+# Maintainer: Peter Jung <ptr1337@archlinux.org>
+# Contributor: Denis Benato <benato.denis96@gmail.com>
+# Contributor: William Edwards <shadowapex@gmail.com>
+#
+# Arch Linux package with Kazeta patches on top:
+# - dualsense-rumble.patch: stop DualSense rumble when the effect length
+#   elapses and when the magnitude is zero (it kept vibrating long after games
+#   asked for a short rumble)
+
+pkgname=inputplumber
+pkgver=0.82.0
+pkgrel=1.1
+pkgdesc="Open source input router and remapper daemon for Linux"
+arch=('x86_64')
+options=(!lto)
+url="https://github.com/ShadowBlip/InputPlumber"
+license=('GPL-3.0-only')
+depends=(
+  dbus
+  libgcc
+  glibc
+  libevdev
+  libiio
+  systemd-libs
+)
+makedepends=(
+  clang
+  cmake
+  git
+  make
+  rust
+)
+source=("git+https://github.com/ShadowBlip/InputPlumber.git#tag=v${pkgver}"
+        dualsense-rumble.patch)
+sha256sums=('7b2091ad0ea0839bce8dd42a028610c1877a63f18ad391da8d2210eb87e78558'
+            'f244984f292bc1261a88109d20deb4dd1741c9a4de5320cec9a006e3a68bd88a')
+
+prepare() {
+  cd "$srcdir/InputPlumber"
+  patch -Np1 -i "$srcdir/dualsense-rumble.patch"
+}
+
+build() {
+  cd "$srcdir/InputPlumber"
+  make build
+}
+
+package() {
+  cd "$srcdir/InputPlumber"
+  make install PREFIX=${pkgdir}/usr NO_RELOAD=true
+}
