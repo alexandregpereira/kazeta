@@ -36,7 +36,7 @@ if [ "$1" == "install" ]; then
 	mkdir -p "$runtimedir"
 
 	mount "$runtime" "$runtimedir"
-	mount -t overlay overlay -o metacopy=on,xino=off,lowerdir="$runtimedir",upperdir="$gamedir",workdir="$workdir" "$targetdir"
+	mount -t overlay overlay -o metacopy=on,xino=off,index=off,lowerdir="$runtimedir",upperdir="$gamedir",workdir="$workdir" "$targetdir"
 
 	exit 0
 fi
@@ -63,5 +63,7 @@ else
 
 	# metacopy=on reduces the pressure vessel writes
 	# xino=off fixes 32-bit applications crashing
-	mount -t overlay overlay -o metacopy=on,xino=off,lowerdir="$lowerdir:$runtimedir",upperdir="$upperdir",workdir="$workdir" "$targetdir"
+	# index=off: the kernel default (index=on) ties the save (upperdir) to the
+	# filesystem UUID of the cart, so a re-flashed cart fails to mount
+	mount -t overlay overlay -o metacopy=on,xino=off,index=off,lowerdir="$lowerdir:$runtimedir",upperdir="$upperdir",workdir="$workdir" "$targetdir"
 fi
