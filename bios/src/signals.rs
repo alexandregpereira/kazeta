@@ -40,12 +40,26 @@ pub fn install() -> Terminated {
     Terminated(flag)
 }
 
+/// Send `signal` to the process group led by `child` (see `Command::process_group(0)`),
+/// or to the child alone if it does not lead a group
+fn signal_group(child: &Child, signal: libc::c_int) {
+    let pid = child.id() as libc::pid_t;
+    if unsafe { libc::kill(-pid, signal) } != 0 {
+        unsafe { libc::kill(pid, signal) };
+    }
+}
+
 /// Wait for `child` to exit, passing on SIGTERM once `stop` returns true (e.g. after a
-/// termination signal) and killing it if it is still running after `kill_timeout`
+/// termination signal) and killing it if it is still running after `kill_timeout`.
+/// The child should lead its own process group: the signals then reach everything it started,
+/// and whatever is left of the group once it has exited is killed, so no leftover process keeps
+/// the cart mounted or its output pipe open.
 pub fn wait_child(child: &mut Child, stop: &dyn Fn() -> bool, kill_timeout: Duration) -> std::io::Result<ExitStatus> {
     let mut forwarded_at: Option<Instant> = None;
     loop {
         if let Some(status) = child.try_wait()? {
+            // a group outlives its leader while any member is left, so its id is not reused yet
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
             return Ok(status);
         }
 
@@ -53,12 +67,12 @@ pub fn wait_child(child: &mut Child, stop: &dyn Fn() -> bool, kill_timeout: Dura
         if stop() {
             match forwarded_at {
                 None => {
-                    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+                    signal_group(child, libc::SIGTERM);
                     forwarded_at = Some(Instant::now());
                 }
                 Some(at) if at.elapsed() > kill_timeout => {
                     eprintln!("Child {} did not exit, killing it", child.id());
-                    let _ = child.kill();
+                    signal_group(child, libc::SIGKILL);
                 }
                 _ => {}
             }
