@@ -7,6 +7,7 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -26,6 +27,9 @@ pub const UI_ARG: &str = "--ui";
 const PLAYTIME_INTERVAL: Duration = Duration::from_secs(60);
 /// How long gamescope gets to exit after a termination signal before it is killed
 const GAMESCOPE_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the game's output is still read after gamescope exited, in case a process that
+/// escaped its process group keeps the pipe open
+const LOG_WRITER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-user directory for files handed between processes, so multiple users or instances do not collide
 pub fn runtime_dir() -> PathBuf {
@@ -160,6 +164,8 @@ fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn 
         .arg(exe)
         .arg(UI_ARG)
         .args(ignored_cart)
+        // own process group, so stopping it reaches everything it started
+        .process_group(0)
         .spawn();
     match child {
         Ok(mut child) => {
@@ -497,6 +503,8 @@ fn run_game(cart_home: &Path, cart_gsopts: &[String], cart_exec_file: &Path, sto
         .env("XDG_CACHE_HOME", cart_home.join(".cache"))
         .env("XDG_STATE_HOME", cart_home.join(".local/state"))
         .stdout(Stdio::piped())
+        // own process group, so stopping the game reaches everything it started
+        .process_group(0)
         .spawn();
 
     let mut child = match child {
@@ -510,7 +518,9 @@ fn run_game(cart_home: &Path, cart_gsopts: &[String], cart_exec_file: &Path, sto
     // game output goes to the cart's run log, minus pressure-vessel noise
     let stdout = child.stdout.take();
     let log_path = cart_home.join(".kazeta/var/run.log");
+    let (log_done, log_done_rx) = mpsc::channel::<()>();
     let log_writer = stdout.map(|stdout| thread::spawn(move || {
+        let _log_done = log_done;
         let mut log = fs::File::create(&log_path)
             .map_err(|e| eprintln!("Failed to create {}: {}", log_path.display(), e))
             .ok();
@@ -526,7 +536,14 @@ fn run_game(cart_home: &Path, cart_gsopts: &[String], cart_exec_file: &Path, sto
 
     let status = signals::wait_child(&mut child, stop, GAMESCOPE_KILL_TIMEOUT);
     if let Some(log_writer) = log_writer {
-        let _ = log_writer.join();
+        // the writer ends when every process holding the pipe has exited; do not hang on one
+        // that escaped the process group, the thread is left behind instead
+        match log_done_rx.recv_timeout(LOG_WRITER_TIMEOUT) {
+            Err(mpsc::RecvTimeoutError::Timeout) => eprintln!("Game output still open, not waiting for it"),
+            _ => {
+                let _ = log_writer.join();
+            }
+        }
     }
 
     match status {
