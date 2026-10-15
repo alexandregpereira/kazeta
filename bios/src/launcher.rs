@@ -5,16 +5,16 @@
 // Session duties (controllers, audio, logging, power off) are left to kazeta-session.
 
 use std::fs;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 use chrono::{Local, SecondsFormat};
 
+use crate::intro;
 use crate::save;
 use crate::power;
 use crate::signals;
@@ -23,19 +23,12 @@ use crate::volume;
 const NONE_RUNTIME: &str = "/usr/share/kazeta/runtimes/none.kzr";
 /// Argument the launcher starts the bios UI with under gamescope
 pub const UI_ARG: &str = "--ui";
-/// Argument that plays the boot intro on its own, for previewing it
-pub const INTRO_ARG: &str = "--intro";
-/// How much of the cart is read into the page cache while the intro plays
-const PRELOAD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
-const PRELOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
-/// Files up to this size (executables, libraries, engine data) are read before the larger ones
-const PRELOAD_SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
 const PLAYTIME_INTERVAL: Duration = Duration::from_secs(60);
 /// How long gamescope gets to exit after a termination signal before it is killed
 const GAMESCOPE_KILL_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-user directory for files handed between processes, so multiple users or instances do not collide
-fn runtime_dir() -> PathBuf {
+pub fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }
 
@@ -46,11 +39,6 @@ fn cart_exec_file() -> PathBuf {
 /// Written by the bios UI with the path of the cart to launch once it exits
 pub fn boot_cart_file() -> PathBuf {
     runtime_dir().join("kazeta-boot-cart")
-}
-
-/// Created by the launcher once the cart is mounted and preloaded, so the intro may end
-pub fn intro_ready_file() -> PathBuf {
-    runtime_dir().join("kazeta-intro-ready")
 }
 
 fn now_iso8601() -> String {
@@ -235,148 +223,6 @@ fn find_runtime(media_path: &Path, runtime_name: &str) -> PathBuf {
     PathBuf::from(NONE_RUNTIME)
 }
 
-/// Split a cart's Exec line into words, honoring double and single quotes
-fn exec_words(exec: &str) -> Vec<String> {
-    let mut words = Vec::new();
-    let mut word = String::new();
-    let mut quote: Option<char> = None;
-    for c in exec.chars() {
-        match quote {
-            Some(q) if c == q => quote = None,
-            Some(_) => word.push(c),
-            None if c == '"' || c == '\'' => quote = Some(c),
-            None if c.is_whitespace() => {
-                if !word.is_empty() {
-                    words.push(std::mem::take(&mut word));
-                }
-            }
-            None => word.push(c),
-        }
-    }
-    if !word.is_empty() {
-        words.push(word);
-    }
-    words
-}
-
-/// All regular files below `dir` with their sizes, without following symlinks
-fn cart_files(dir: &Path, files: &mut Vec<(u64, PathBuf)>) {
-    let Ok(entries) = fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        let Ok(meta) = entry.path().symlink_metadata() else { continue };
-        if meta.is_dir() {
-            cart_files(&entry.path(), files);
-        } else if meta.is_file() {
-            files.push((meta.len(), entry.path()));
-        }
-    }
-}
-
-/// Order in which the preload reads a cart:
-/// 1. small files named in Exec (following a leading `cd <dir>`), usually the game executable
-/// 2. other small files, which hold what games read when they start (executables, libraries,
-///    engine data), shallowest first since content packs tend to be nested deeper
-/// 3. large files named in Exec, such as a disc image passed to an emulator
-/// 4. other large files, smallest first
-fn preload_order(cart_path: &Path, cart_exec: &str) -> Vec<PathBuf> {
-    let cart_path = &fs::canonicalize(cart_path).unwrap_or_else(|_| cart_path.to_path_buf());
-    let mut exec_files: Vec<PathBuf> = Vec::new();
-    let mut exec_dir = cart_path.to_path_buf();
-    let mut words = exec_words(cart_exec).into_iter();
-    while let Some(word) = words.next() {
-        if word == "cd" {
-            if let Some(dir) = words.next() {
-                exec_dir = cart_path.join(dir);
-            }
-            continue;
-        }
-        for path in [exec_dir.join(&word), cart_path.join(&word)] {
-            if let Ok(path) = fs::canonicalize(&path) {
-                if path.starts_with(cart_path) && path.is_file() && !exec_files.contains(&path) {
-                    exec_files.push(path);
-                }
-            }
-        }
-    }
-
-    let mut files = Vec::new();
-    cart_files(cart_path, &mut files);
-    let class = |size: u64, path: &Path| {
-        let in_exec = exec_files.iter().position(|exec| exec == path);
-        let small = size <= PRELOAD_SMALL_FILE_BYTES;
-        match (small, in_exec) {
-            (true, Some(index)) => (0, index),
-            (true, None) => (1, 0),
-            (false, Some(index)) => (2, index),
-            (false, None) => (3, 0),
-        }
-    };
-    let depth = |path: &Path| path.components().count();
-    files.sort_by(|a, b| {
-        class(a.0, &a.1).cmp(&class(b.0, &b.1)).then_with(|| {
-            if a.0 <= PRELOAD_SMALL_FILE_BYTES {
-                depth(&a.1).cmp(&depth(&b.1)).then_with(|| a.1.cmp(&b.1))
-            } else {
-                a.0.cmp(&b.0)
-            }
-        })
-    });
-    files.into_iter().map(|(_, path)| path).collect()
-}
-
-/// Read up to PRELOAD_MAX_BYTES of the cart so the game finds it in the page cache
-fn preload_cart(order: Vec<PathBuf>, cancel: &AtomicBool) {
-    let mut budget = PRELOAD_MAX_BYTES;
-    let mut buffer = vec![0u8; PRELOAD_CHUNK_SIZE];
-    'files: for path in order {
-        let Ok(mut file) = fs::File::open(&path) else { continue };
-        loop {
-            if budget == 0 || cancel.load(Ordering::Relaxed) {
-                break 'files;
-            }
-            let len = buffer.len().min(budget as usize);
-            match file.read(&mut buffer[..len]) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => budget -= n as u64,
-            }
-        }
-    }
-    eprintln!("Preloaded {} MB of the cart", (PRELOAD_MAX_BYTES - budget) / (1024 * 1024));
-}
-
-/// Reads the cart into the page cache in the background while the intro plays
-struct Preload {
-    cancel: Arc<AtomicBool>,
-    handle: Option<thread::JoinHandle<()>>,
-}
-
-impl Preload {
-    /// `ready_file` is created once the preload is done, so the intro may end
-    fn start(cart_path: &Path, cart_exec: &str, ready_file: &Path) -> Self {
-        let cancel = Arc::new(AtomicBool::new(false));
-        let thread_cancel = cancel.clone();
-        let cart_path = cart_path.to_path_buf();
-        let cart_exec = cart_exec.to_string();
-        let ready_file = ready_file.to_path_buf();
-        let handle = thread::spawn(move || {
-            preload_cart(preload_order(&cart_path, &cart_exec), &thread_cancel);
-            if !thread_cancel.load(Ordering::Relaxed) {
-                let _ = fs::File::create(&ready_file);
-            }
-        });
-        Preload { cancel, handle: Some(handle) }
-    }
-}
-
-impl Drop for Preload {
-    fn drop(&mut self) {
-        self.cancel.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
-    }
-}
-
 /// Periodically records the end of the current play session until stopped
 struct PlaytimeCapture {
     stop: mpsc::Sender<()>,
@@ -467,7 +313,7 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         // the bios waits for a cart and leaves its path behind when one should be launched; it then
         // plays the intro while the cart is mounted and preloaded here
         let boot_cart_file = boot_cart_file();
-        let ready_file = intro_ready_file();
+        let ready_file = intro::ready_file();
         let _ = fs::remove_file(&boot_cart_file);
         let _ = fs::remove_file(&ready_file);
         let mut prepared: Option<PreparedCart> = None;
@@ -521,7 +367,7 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
 /// A mounted cart, ready to run
 struct PreparedCart {
     // declared first so it is stopped before the cart is unmounted
-    preload: Option<Preload>,
+    preload: Option<intro::Preload>,
     // unmounts the cart when dropped
     _cleanup: CartCleanup,
     cart_home: PathBuf,
@@ -583,7 +429,7 @@ fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Op
     cleanup.cart_home = Some(cart_home.clone());
 
     let cart_exec = attr("Exec");
-    let preload = ready_file.map(|ready_file| Preload::start(&cart_path, &cart_exec, ready_file));
+    let preload = ready_file.map(|ready_file| intro::Preload::start(&cart_path, &cart_exec, ready_file));
     let cart_gsopts: Vec<String> = match attr("GamescopeOptions") {
         opts if opts.is_empty() => resolution_gamescope_args(),
         opts => opts.split_whitespace().map(String::from).collect(),

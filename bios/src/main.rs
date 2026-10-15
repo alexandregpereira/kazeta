@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU16, Ordering, AtomicBool};
 use std::fs;
 use std::process;
 
+mod intro;
 mod launcher;
 mod power;
 mod save;
@@ -1441,160 +1442,15 @@ fn render_cart_select(
     }
 }
 
-// Boot intro played once a cart is handed over to the launcher
-const INTRO_BLACK: f64 = 0.4; // black screen before the logo when started on its own
-const INTRO_ENTER: f64 = 1.0; // logo moves to the center with a zoom pulse
-const INTRO_PULSE: f32 = 0.12; // extra zoom at the middle of the entrance
-const INTRO_COLOR_STEP: f64 = 0.6; // seconds between colors while waiting
-const INTRO_MIN: f64 = 3.0; // minimum time before the intro may end
-const INTRO_MAX: f64 = 120.0; // safety limit in case the cart media hangs while preloading
-const INTRO_EXIT: f64 = 0.8; // fade to black
-const INTRO_READY_POLL: f64 = 0.1;
-const INTRO_COLORS: [Color; 6] = [
-    Color { r: 1.0, g: 0.5, b: 0.5, a: 1.0 },
-    Color { r: 1.0, g: 1.0, b: 0.5, a: 1.0 },
-    Color { r: 0.5, g: 1.0, b: 0.5, a: 1.0 },
-    Color { r: 0.5, g: 1.0, b: 1.0, a: 1.0 },
-    Color { r: 0.5, g: 0.5, b: 1.0, a: 1.0 },
-    Color { r: 1.0, g: 0.5, b: 1.0, a: 1.0 },
-];
-
-fn lerp_color(a: Color, b: Color, t: f32) -> Color {
-    Color {
-        r: a.r + (b.r - a.r) * t,
-        g: a.g + (b.g - a.g) * t,
-        b: a.b + (b.b - a.b) * t,
-        a: a.a + (b.a - a.a) * t,
-    }
-}
-
-/// The logo moves from where it was to the center with a zoom pulse and the boot chime, cycles
-/// colors while the launcher prepares the cart and fades to black once the ready file exists
-struct IntroAnimation {
-    start: f64,
-    delay: f64,
-    from_pos: Vec2,
-    from_alpha: f32,
-    from_scale: f32,
-    sound_played: bool,
-    last_poll: f64,
-    ready: bool,
-    exit_start: Option<f64>,
-}
-
-impl IntroAnimation {
-    /// `from_pos` is the top left corner of the unscaled logo when the intro starts
-    fn new(from_pos: Vec2, from_alpha: f32, from_scale: f32, delay: f64) -> Self {
-        IntroAnimation {
-            start: get_time(),
-            delay,
-            from_pos,
-            from_alpha,
-            from_scale,
-            sound_played: false,
-            last_poll: f64::MIN,
-            ready: false,
-            exit_start: None,
-        }
-    }
-
-    /// Draw one frame; returns true once the intro has faded out
-    fn draw(&mut self, logo: &Texture2D, sound_effects: &SoundEffects, ready_file: &std::path::Path) -> bool {
-        let elapsed = get_time() - self.start;
-
-        if elapsed >= self.delay {
-            if !self.sound_played {
-                sound_effects.play_boot();
-                self.sound_played = true;
-            }
-
-            let enter = ((elapsed - self.delay) / INTRO_ENTER).min(1.0) as f32;
-            let eased = 1.0 - (1.0 - enter).powi(3);
-            let scale = self.from_scale + (1.0 - self.from_scale) * eased
-                + INTRO_PULSE * (std::f32::consts::PI * enter).sin();
-
-            // white during the entrance, then slowly cycle through the colors
-            let hold = (elapsed - self.delay - INTRO_ENTER).max(0.0) / INTRO_COLOR_STEP;
-            let index = hold as usize;
-            let mut color = if hold <= 0.0 {
-                WHITE
-            } else if index == 0 {
-                lerp_color(WHITE, INTRO_COLORS[0], hold as f32)
-            } else {
-                lerp_color(
-                    INTRO_COLORS[(index - 1) % INTRO_COLORS.len()],
-                    INTRO_COLORS[index % INTRO_COLORS.len()],
-                    hold.fract() as f32,
-                )
-            };
-            color.a = self.from_alpha + (1.0 - self.from_alpha) * eased;
-
-            let center = Vec2::new(
-                ((SCREEN_WIDTH as f32 - logo.width()) / 2.0).round(),
-                ((SCREEN_HEIGHT as f32 - logo.height()) / 2.0).round(),
-            );
-            let pos = self.from_pos + (center - self.from_pos) * eased;
-            // scale around the middle of the logo
-            let w = (logo.width() * scale).round();
-            let h = (logo.height() * scale).round();
-            let x = (pos.x + (logo.width() - w) / 2.0).round();
-            let y = (pos.y + (logo.height() - h) / 2.0).round();
-            draw_texture_ex(logo, x, y, color, DrawTextureParams {
-                dest_size: Some(Vec2::new(w, h)),
-                ..Default::default()
-            });
-        }
-
-        if self.exit_start.is_none() {
-            if !self.ready && elapsed - self.last_poll >= INTRO_READY_POLL {
-                self.ready = ready_file.exists();
-                self.last_poll = elapsed;
-            }
-            if elapsed >= INTRO_MIN && (self.ready || elapsed >= INTRO_MAX) {
-                self.exit_start = Some(elapsed);
-            }
-        }
-
-        match self.exit_start {
-            Some(exit_time) => {
-                let progress = ((elapsed - exit_time) / INTRO_EXIT).min(1.0) as f32;
-                draw_rectangle(0.0, 0.0, SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32,
-                    Color { r: 0.0, g: 0.0, b: 0.0, a: progress });
-                progress >= 1.0
-            }
-            None => false,
-        }
-    }
-}
-
-/// Play the intro on its own, ending once `ready_file` exists; for previewing it
-async fn run_intro(ready_file: std::path::PathBuf) {
-    let logo = Texture2D::from_file_with_format(include_bytes!("../logo.png"), Some(ImageFormat::Png));
-    logo.set_filter(FilterMode::Nearest);
-    let sound_effects = SoundEffects::new().await;
-    let center = Vec2::new(
-        ((SCREEN_WIDTH as f32 - logo.width()) / 2.0).round(),
-        ((SCREEN_HEIGHT as f32 - logo.height()) / 2.0).round(),
-    );
-    let mut intro = IntroAnimation::new(center, 0.0, 0.6, INTRO_BLACK);
-    loop {
-        clear_background(BLACK);
-        if intro.draw(&logo, &sound_effects, &ready_file) {
-            process::exit(0);
-        }
-        next_frame().await
-    }
-}
-
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         // started by the launcher under gamescope
         Some(launcher::UI_ARG) => macroquad::Window::from_config(window_conf(), bios_main(args.get(2).map(std::path::PathBuf::from))),
         // boot intro started by the launcher while it prepares a cart; ends once the ready file exists
-        Some(launcher::INTRO_ARG) => macroquad::Window::from_config(
+        Some(intro::INTRO_ARG) => macroquad::Window::from_config(
             window_conf(),
-            run_intro(args.get(2).map(std::path::PathBuf::from).unwrap_or_else(launcher::intro_ready_file)),
+            intro::run_intro(args.get(2).map(std::path::PathBuf::from).unwrap_or_else(intro::ready_file)),
         ),
         // run the given cart, or the bios which waits for one
         cart => process::exit(launcher::run(cart)),
@@ -1651,8 +1507,8 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
     let mut transition_to_menu = false;
 
     // boot intro, played once a cart has been handed over to the launcher
-    let mut intro: Option<IntroAnimation> = None;
-    let intro_ready_file = launcher::intro_ready_file();
+    let mut intro: Option<intro::IntroAnimation> = None;
+    let intro_ready_file = intro::ready_file();
 
     // Watch for carts while the launcher or cart selection screen is shown
     let inserted_carts: Arc<Mutex<Vec<InsertedCart>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1861,7 +1717,7 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                         let from_pos = logo_bounce.take()
                             .map(|(position, _)| position.round())
                             .unwrap_or(Vec2::new(LOGO_X, logo_center_y));
-                        intro = Some(IntroAnimation::new(from_pos, logo_alpha, 1.0, 0.0));
+                        intro = Some(intro::IntroAnimation::new(from_pos, logo_alpha, 1.0, 0.0));
                         current_screen = Screen::Intro;
                     }
                 } else if carts.len() > 1 && logo_shown_long_enough {
@@ -1944,7 +1800,7 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                 if cart_select_leaving {
                     if cart_select_reveal <= 0.0 {
                         if cart_chosen {
-                            intro = Some(IntroAnimation::new(Vec2::new(LOGO_X, logo_center_y), logo_alpha, 1.0, 0.0));
+                            intro = Some(intro::IntroAnimation::new(Vec2::new(LOGO_X, logo_center_y), logo_alpha, 1.0, 0.0));
                             current_screen = Screen::Intro;
                         } else {
                             current_screen = Screen::Launcher;
