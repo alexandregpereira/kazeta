@@ -31,10 +31,6 @@ fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }
 
-fn cart_exec_file() -> PathBuf {
-    runtime_dir().join("kazeta-cart-exec")
-}
-
 /// Written by the bios UI with the path of the cart to launch once it exits
 pub fn boot_cart_file() -> PathBuf {
     runtime_dir().join("kazeta-boot-cart")
@@ -388,7 +384,10 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
         opts if opts.is_empty() => resolution_gamescope_args(),
         opts => opts.split_whitespace().map(String::from).collect(),
     };
-    let cart_exec_file = cart_exec_file();
+    // inside the cart's home, which the linux runtime's container shares; the runtime reads
+    // this file from inside the container, which does not see XDG_RUNTIME_DIR
+    let cart_exec_file = cart_home.join(".kazeta/var/cart-exec");
+    let _ = fs::create_dir_all(cart_home.join(".kazeta/var"));
     let _ = fs::write(&cart_exec_file, format!("{}\n", cart_exec));
 
     let var_dir = cart_home.join(".kazeta/var");
