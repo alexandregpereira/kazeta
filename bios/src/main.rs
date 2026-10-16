@@ -1822,6 +1822,8 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
 
                     // If fade is complete, wait for linger duration then exit
                     if fade_progress >= 1.0 && elapsed - FADE_DURATION >= FADE_LINGER_DURATION {
+                        // lets the launcher stop gamescope if closing it hangs
+                        let _ = fs::File::create(launcher::bios_done_file());
                         process::exit(0);
                     }
                 }

@@ -26,6 +26,9 @@ pub const UI_ARG: &str = "--ui";
 const PLAYTIME_INTERVAL: Duration = Duration::from_secs(60);
 /// How long gamescope gets to exit after a termination signal before it is killed
 const GAMESCOPE_KILL_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long the bios gamescope gets to exit once the bios UI in it is done. Closing it can hang
+/// for the 25 s D-Bus timeout: libseat's "close device" call to logind sometimes gets no answer.
+const BIOS_GAMESCOPE_EXIT_GRACE: Duration = Duration::from_secs(2);
 /// How long the game's output is still read after gamescope exited, in case a process that
 /// escaped its process group keeps the pipe open
 const LOG_WRITER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -38,6 +41,11 @@ fn runtime_dir() -> PathBuf {
 /// Written by the bios UI with the path of the cart to launch once it exits
 pub fn boot_cart_file() -> PathBuf {
     runtime_dir().join("kazeta-boot-cart")
+}
+
+/// Created by the bios UI right before it exits after handing over a cart
+pub fn bios_done_file() -> PathBuf {
+    runtime_dir().join("kazeta-bios-done")
 }
 
 fn now_iso8601() -> String {
@@ -165,9 +173,28 @@ fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn 
         // own process group, so stopping it reaches everything it started
         .process_group(0)
         .spawn();
+    let bios_done_file = bios_done_file();
+    let _ = fs::remove_file(&bios_done_file);
     match child {
         Ok(mut child) => {
+            // once the bios UI is done, gamescope has nothing left to show; do not wait for it to
+            // finish closing if that hangs. Killed, its devices are closed by the kernel and
+            // logind takes the display back by itself.
+            let mut done_at: Option<std::time::Instant> = None;
+            while matches!(child.try_wait(), Ok(None)) && !stop() {
+                match done_at {
+                    None if bios_done_file.exists() => done_at = Some(std::time::Instant::now()),
+                    Some(at) if at.elapsed() > BIOS_GAMESCOPE_EXIT_GRACE => {
+                        eprintln!("Bios gamescope did not exit after the bios, killing it");
+                        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                        break;
+                    }
+                    _ => {}
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
             let _ = signals::wait_child(&mut child, stop, GAMESCOPE_KILL_TIMEOUT);
+            let _ = fs::remove_file(&bios_done_file);
             0
         }
         Err(e) => {
