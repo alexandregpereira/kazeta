@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use chrono::{Local, SecondsFormat};
 
+use crate::intro;
 use crate::save;
 use crate::power;
 use crate::signals;
@@ -34,7 +35,7 @@ const BIOS_GAMESCOPE_EXIT_GRACE: Duration = Duration::from_secs(2);
 const LOG_WRITER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Per-user directory for files handed between processes, so multiple users or instances do not collide
-fn runtime_dir() -> PathBuf {
+pub fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
 }
 
@@ -46,6 +47,11 @@ pub fn boot_cart_file() -> PathBuf {
 /// Created by the bios UI right before it exits after handing over a cart
 pub fn bios_done_file() -> PathBuf {
     runtime_dir().join("kazeta-bios-done")
+}
+
+/// Log a step of starting a cart with the time, to measure where the boot time goes
+pub fn log_event(event: &str) {
+    eprintln!("[{}] {}", Local::now().format("%H:%M:%S%.3f"), event);
 }
 
 fn now_iso8601() -> String {
@@ -159,8 +165,9 @@ fn pkexec_mount(args: &[&Path]) {
     }
 }
 
-/// Run the bios UI; `ignored_cart` is not started by it until it has been removed
-fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn Fn() -> bool) -> i32 {
+/// Run the bios UI; `ignored_cart` is not started by it until it has been removed.
+/// `on_cart` is called as soon as the UI hands over a cart, while it is still showing the intro.
+fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn Fn() -> bool, on_cart: &mut dyn FnMut(PathBuf)) -> i32 {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kazeta"));
     eprintln!("+ gamescope {:?} --filter pixel -- {} {} {:?}", resolution_args, exe.display(), UI_ARG, ignored_cart);
     let child = Command::new("gamescope")
@@ -177,6 +184,15 @@ fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn 
     let _ = fs::remove_file(&bios_done_file);
     match child {
         Ok(mut child) => {
+            let boot_cart_file = boot_cart_file();
+            while matches!(child.try_wait(), Ok(None)) && !stop() {
+                let cart = fs::read_to_string(&boot_cart_file).unwrap_or_default();
+                if !cart.trim().is_empty() {
+                    on_cart(PathBuf::from(cart.trim()));
+                    break;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
             // once the bios UI is done, gamescope has nothing left to show; do not wait for it to
             // finish closing if that hangs. Killed, its devices are closed by the kernel and
             // logind takes the display back by itself.
@@ -195,6 +211,7 @@ fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn 
             }
             let _ = signals::wait_child(&mut child, stop, GAMESCOPE_KILL_TIMEOUT);
             let _ = fs::remove_file(&bios_done_file);
+            log_event("Bios gamescope exited");
             0
         }
         Err(e) => {
@@ -328,12 +345,28 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         // a press that stopped the game must not also shut down from the bios
         power_key.clear();
 
-        // the bios waits for a cart and leaves its path behind when one should be launched
+        // the bios waits for a cart and leaves its path behind when one should be launched; it then
+        // plays the intro while the cart is mounted and preloaded here
         let boot_cart_file = boot_cart_file();
+        let ready_file = intro::ready_file();
         let _ = fs::remove_file(&boot_cart_file);
-        let status = run_bios(&resolution_gamescope_args(), last_cart.as_deref(), &stop);
+        let _ = fs::remove_file(&ready_file);
+        let mut prepared: Option<PreparedCart> = None;
+        let status = run_bios(&resolution_gamescope_args(), last_cart.as_deref(), &stop, &mut |cart| {
+            log_event(&format!("Cart handed over: {}", cart.display()));
+            prepared = prepare_cart(cart, &base_dir, Some(&ready_file));
+            log_event("Cart mounted");
+            if prepared.is_none() {
+                // nothing to wait for, let the intro end
+                let _ = fs::File::create(&ready_file);
+            }
+        });
         let cart = fs::read_to_string(&boot_cart_file).ok().map(|path| PathBuf::from(path.trim()));
         let _ = fs::remove_file(&boot_cart_file);
+        let _ = fs::remove_file(&ready_file);
+        if cart.is_some() {
+            log_event("Bios exited");
+        }
 
         if terminated.get() {
             return 1;
@@ -347,7 +380,11 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         };
 
         // a power button press stops the game and brings us back to the bios
-        let status = run_cart(cart.clone(), &base_dir, &stop);
+        let prepared = prepared.or_else(|| prepare_cart(cart.clone(), &base_dir, None));
+        let status = match prepared {
+            Some(prepared) if !stop() => play_cart(prepared, &stop),
+            _ => 1,
+        };
         eprintln!("Game exited with status {}", status);
         if terminated.get() {
             return 1;
@@ -361,6 +398,23 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
     if stop() {
         return 1;
     }
+    match prepare_cart(cart, base_dir, None) {
+        Some(prepared) if !stop() => play_cart(prepared, stop),
+        _ => 1,
+    }
+}
+
+/// A mounted cart, ready to run
+struct PreparedCart {
+    // unmounts the cart when dropped
+    _cleanup: CartCleanup,
+    cart_home: PathBuf,
+    cart_gsopts: Vec<String>,
+    cart_exec_file: PathBuf,
+}
+
+/// Mount a cart; with `ready_file`, create it once the cart is mounted so the intro may end
+fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Option<PreparedCart> {
     let is_pkg = cart.extension().is_some_and(|ext| ext == "kzp");
 
     let mut cleanup = CartCleanup { pkg_mount: None, mounted: None, upper: None, cart_home: None };
@@ -372,7 +426,7 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
         cleanup.pkg_mount = Some(cart_path.clone());
         let Some(cart_info) = find_cart_file(&cart_path, "kzi") else {
             eprintln!("No cart info found in {}", cart_pkg.display());
-            return 1;
+            return None;
         };
         let media_path = cart_pkg.parent().unwrap_or(Path::new("/")).to_path_buf();
         (cart_info, cart_path, media_path)
@@ -413,6 +467,9 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
     cleanup.cart_home = Some(cart_home.clone());
 
     let cart_exec = attr("Exec");
+    if let Some(ready_file) = ready_file {
+        let _ = fs::File::create(ready_file);
+    }
     let cart_gsopts: Vec<String> = match attr("GamescopeOptions") {
         opts if opts.is_empty() => resolution_gamescope_args(),
         opts => opts.split_whitespace().map(String::from).collect(),
@@ -422,6 +479,13 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
     let cart_exec_file = cart_home.join(".kazeta/var/cart-exec");
     let _ = fs::create_dir_all(cart_home.join(".kazeta/var"));
     let _ = fs::write(&cart_exec_file, format!("{}\n", cart_exec));
+
+    Some(PreparedCart { _cleanup: cleanup, cart_home, cart_gsopts, cart_exec_file })
+}
+
+/// Run a prepared cart until the game exits or `stop` returns true, then unmount it
+fn play_cart(prepared: PreparedCart, stop: &dyn Fn() -> bool) -> i32 {
+    let cart_home = prepared.cart_home.clone();
 
     let var_dir = cart_home.join(".kazeta/var");
     let playtime_start = var_dir.join("playtime_start");
@@ -446,11 +510,11 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
     let _ = fs::write(&playtime_start, format!("{}\n", now_iso8601()));
     let playtime = PlaytimeCapture::start(playtime_end);
 
-    // skip the game if we were asked to stop while mounting; cleanup still runs
-    let status = if stop() { 1 } else { run_game(&cart_home, &cart_gsopts, &cart_exec_file, stop) };
+    log_event("Starting the game");
+    let status = run_game(&cart_home, &prepared.cart_gsopts, &prepared.cart_exec_file, stop);
 
     playtime.stop();
-    drop(cleanup);
+    drop(prepared);
 
     status
 }

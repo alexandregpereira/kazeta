@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU16, Ordering, AtomicBool};
 use std::fs;
 use std::process;
 
+mod intro;
 mod launcher;
 mod power;
 mod save;
@@ -34,6 +35,7 @@ struct SoundEffects {
     select: audio::Sound,
     reject: audio::Sound,
     back: audio::Sound,
+    boot: audio::Sound,
 }
 
 impl SoundEffects {
@@ -43,6 +45,7 @@ impl SoundEffects {
             select: audio::load_sound_from_bytes(include_bytes!("../select.wav")).await.unwrap(),
             reject: audio::load_sound_from_bytes(include_bytes!("../reject.wav")).await.unwrap(),
             back: audio::load_sound_from_bytes(include_bytes!("../back.wav")).await.unwrap(),
+            boot: audio::load_sound_from_bytes(include_bytes!("../boot.wav")).await.unwrap(),
         }
     }
 
@@ -64,6 +67,13 @@ impl SoundEffects {
         audio::play_sound(&self.reject, audio::PlaySoundParams {
             looped: false,
             volume: 0.75,
+        });
+    }
+
+    fn play_boot(&self) {
+        audio::play_sound(&self.boot, audio::PlaySoundParams {
+            looped: false,
+            volume: 1.0,
         });
     }
 
@@ -133,7 +143,7 @@ enum Screen {
     SaveData,
     Display,
     CartSelect,
-    FadingOut,
+    Intro,
 }
 
 #[derive(Clone)]
@@ -1437,6 +1447,11 @@ fn main() {
     match args.get(1).map(String::as_str) {
         // started by the launcher under gamescope
         Some(launcher::UI_ARG) => macroquad::Window::from_config(window_conf(), bios_main(args.get(2).map(std::path::PathBuf::from))),
+        // boot intro started by the launcher while it prepares a cart; ends once the ready file exists
+        Some(intro::INTRO_ARG) => macroquad::Window::from_config(
+            window_conf(),
+            intro::run_intro(args.get(2).map(std::path::PathBuf::from).unwrap_or_else(intro::ready_file)),
+        ),
         // run the given cart, or the bios which waits for one
         cart => process::exit(launcher::run(cart)),
     }
@@ -1491,10 +1506,9 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
     let mut menu_reveal: f32 = 0.0;
     let mut transition_to_menu = false;
 
-    // Fade state
-    let mut fade_start_time: Option<f64> = None;
-    const FADE_DURATION: f64 = 1.0; // 1 second fade
-    const FADE_LINGER_DURATION: f64 = 0.5; // 0.5 seconds to linger on black screen
+    // boot intro, played once a cart has been handed over to the launcher
+    let mut intro: Option<intro::IntroAnimation> = None;
+    let intro_ready_file = intro::ready_file();
 
     // Watch for carts while the launcher or cart selection screen is shown
     let inserted_carts: Arc<Mutex<Vec<InsertedCart>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1695,25 +1709,26 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                     draw_texture(&logo, LOGO_X, logo_center_y, Color { a: logo_alpha, ..WHITE });
                 }
 
-                // show the logo for a minimum time at startup before starting an inserted cart
+                // a single cart starts right away, the intro takes over the logo where it is;
+                // with several carts the logo is shown for a minimum time before the selection
                 let logo_shown_long_enough = get_time() - launcher_start_time >= LOGO_MIN_DISPLAY_DURATION;
-                if logo_shown_long_enough {
-                    if carts.len() == 1 {
-                        if hand_over_cart(&carts[0].path) {
-                            sound_effects.play_select();
-                            fade_start_time = Some(get_time());
-                            current_screen = Screen::FadingOut;
-                        }
-                    } else if carts.len() > 1 {
-                        // several games inserted, let the user pick one
-                        cart_selection = 0;
-                        cart_select_list = carts;
-                        cart_select_reveal = 0.0;
-                        cart_select_leaving = false;
-                        cart_chosen = false;
-                        cart_icons.clear();
-                        current_screen = Screen::CartSelect;
+                if carts.len() == 1 {
+                    if hand_over_cart(&carts[0].path) {
+                        let from_pos = logo_bounce.take()
+                            .map(|(position, _)| position.round())
+                            .unwrap_or(Vec2::new(LOGO_X, logo_center_y));
+                        intro = Some(intro::IntroAnimation::new(from_pos, logo_alpha, 1.0, 0.0));
+                        current_screen = Screen::Intro;
                     }
+                } else if carts.len() > 1 && logo_shown_long_enough {
+                    // several games inserted, let the user pick one
+                    cart_selection = 0;
+                    cart_select_list = carts;
+                    cart_select_reveal = 0.0;
+                    cart_select_leaving = false;
+                    cart_chosen = false;
+                    cart_icons.clear();
+                    current_screen = Screen::CartSelect;
                 }
 
                 let launcher_elapsed = get_time() - launcher_screen_time;
@@ -1785,8 +1800,8 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                 if cart_select_leaving {
                     if cart_select_reveal <= 0.0 {
                         if cart_chosen {
-                            fade_start_time = Some(get_time());
-                            current_screen = Screen::FadingOut;
+                            intro = Some(intro::IntroAnimation::new(Vec2::new(LOGO_X, logo_center_y), logo_alpha, 1.0, 0.0));
+                            current_screen = Screen::Intro;
                         } else {
                             current_screen = Screen::Launcher;
                             launcher_screen_time = get_time();
@@ -1813,15 +1828,11 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                     }
                 }
             },
-            Screen::FadingOut => {
-                // During fade, only render, don't process input
-                if let Some(start_time) = fade_start_time {
-                    let elapsed = get_time() - start_time;
-                    let fade_progress = (elapsed / FADE_DURATION).min(1.0) as f32;
-                    draw_texture(&logo, LOGO_X, logo_center_y, Color { a: logo_alpha * (1.0 - fade_progress), ..WHITE });
-
-                    // If fade is complete, wait for linger duration then exit
-                    if fade_progress >= 1.0 && elapsed - FADE_DURATION >= FADE_LINGER_DURATION {
+            Screen::Intro => {
+                // the launcher prepares the cart meanwhile and creates the ready file when done
+                if let Some(intro) = intro.as_mut() {
+                    if intro.draw(&logo, &sound_effects, &intro_ready_file) {
+                        launcher::log_event("Intro: done, the bios exits");
                         // lets the launcher stop gamescope if closing it hangs
                         let _ = fs::File::create(launcher::bios_done_file());
                         process::exit(0);
