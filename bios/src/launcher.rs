@@ -16,6 +16,7 @@ use std::time::Duration;
 use chrono::{Local, SecondsFormat};
 
 use crate::intro;
+use crate::preload;
 use crate::save;
 use crate::power;
 use crate::signals;
@@ -355,7 +356,7 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         let status = run_bios(&resolution_gamescope_args(), last_cart.as_deref(), &stop, &mut |cart| {
             log_event(&format!("Cart handed over: {}", cart.display()));
             prepared = prepare_cart(cart, &base_dir, Some(&ready_file));
-            log_event("Cart mounted");
+            log_event("Cart mounted, preloading");
             if prepared.is_none() {
                 // nothing to wait for, let the intro end
                 let _ = fs::File::create(&ready_file);
@@ -406,14 +407,18 @@ fn run_cart(cart: PathBuf, base_dir: &Path, stop: &dyn Fn() -> bool) -> i32 {
 
 /// A mounted cart, ready to run
 struct PreparedCart {
+    // declared first so it is stopped before the cart is unmounted
+    preload: Option<preload::Preload>,
     // unmounts the cart when dropped
     _cleanup: CartCleanup,
+    cart_path: PathBuf,
+    cart_exec: String,
     cart_home: PathBuf,
     cart_gsopts: Vec<String>,
     cart_exec_file: PathBuf,
 }
 
-/// Mount a cart; with `ready_file`, create it once the cart is mounted so the intro may end
+/// Mount a cart; with `ready_file`, also start preloading it, which creates the file when done
 fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Option<PreparedCart> {
     let is_pkg = cart.extension().is_some_and(|ext| ext == "kzp");
 
@@ -467,9 +472,7 @@ fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Op
     cleanup.cart_home = Some(cart_home.clone());
 
     let cart_exec = attr("Exec");
-    if let Some(ready_file) = ready_file {
-        let _ = fs::File::create(ready_file);
-    }
+    let preload = ready_file.map(|ready_file| preload::Preload::start(&cart_path, &cart_home, ready_file));
     let cart_gsopts: Vec<String> = match attr("GamescopeOptions") {
         opts if opts.is_empty() => resolution_gamescope_args(),
         opts => opts.split_whitespace().map(String::from).collect(),
@@ -480,11 +483,13 @@ fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Op
     let _ = fs::create_dir_all(cart_home.join(".kazeta/var"));
     let _ = fs::write(&cart_exec_file, format!("{}\n", cart_exec));
 
-    Some(PreparedCart { _cleanup: cleanup, cart_home, cart_gsopts, cart_exec_file })
+    Some(PreparedCart { preload, _cleanup: cleanup, cart_path, cart_exec, cart_home, cart_gsopts, cart_exec_file })
 }
 
 /// Run a prepared cart until the game exits or `stop` returns true, then unmount it
-fn play_cart(prepared: PreparedCart, stop: &dyn Fn() -> bool) -> i32 {
+fn play_cart(mut prepared: PreparedCart, stop: &dyn Fn() -> bool) -> i32 {
+    // the intro is over, the preload must not compete with the game
+    prepared.preload = None;
     let cart_home = prepared.cart_home.clone();
 
     let var_dir = cart_home.join(".kazeta/var");
@@ -510,8 +515,11 @@ fn play_cart(prepared: PreparedCart, stop: &dyn Fn() -> bool) -> i32 {
     let _ = fs::write(&playtime_start, format!("{}\n", now_iso8601()));
     let playtime = PlaytimeCapture::start(playtime_end);
 
+    // records what the game reads at startup, for the next intro's preload
     log_event("Starting the game");
+    let trace = preload::TraceRecorder::start(&prepared.cart_path, &cart_home, &prepared.cart_exec);
     let status = run_game(&cart_home, &prepared.cart_gsopts, &prepared.cart_exec_file, stop);
+    drop(trace);
 
     playtime.stop();
     drop(prepared);

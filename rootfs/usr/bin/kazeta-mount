@@ -19,6 +19,18 @@ if [ "$1" == "kzp" ]; then
 	exit 0
 fi
 
+if [ "$1" == "cache-ranges" ]; then
+	# prints which parts of a cart are in the page cache, to record what a game read; the kernel
+	# only tells root about files the caller cannot write. Limited to cart directories, and always
+	# the system binary, never a user's custom build.
+	dir="$(realpath -e "$2")" || exit 1
+	case "$dir" in
+		/media/*|/run/media/*|/home/*/.local/share/kazeta/run/pkg) ;;
+		*) echo "not a cart directory: $dir"; exit 1 ;;
+	esac
+	exec /usr/bin/kazeta --cache-ranges "$dir"
+fi
+
 if [ "$1" == "install" ]; then
 	gamedir="$2"
 	workdir="$3"
