@@ -4,16 +4,18 @@
 // once it exists (after a minimum time). What the game reads is recorded once it has started,
 // and the next preload reads exactly that.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
-use std::process;
+use std::process::{self, Command};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use chrono::Local;
 use macroquad::prelude::*;
 
 use crate::launcher;
@@ -21,6 +23,8 @@ use crate::{SoundEffects, SCREEN_HEIGHT, SCREEN_WIDTH};
 
 /// Argument that plays the boot intro on its own, for previewing it
 pub const INTRO_ARG: &str = "--intro";
+/// Argument that prints the cached ranges of a cart, see print_cache_ranges
+pub const CACHE_RANGES_ARG: &str = "--cache-ranges";
 /// How much of the cart is read into the page cache while the intro plays
 const PRELOAD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const PRELOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
@@ -385,14 +389,14 @@ impl Preload {
             };
             let cancelled = thread_cancel.load(Ordering::Relaxed);
             let secs = start.elapsed().as_secs_f64();
-            eprintln!(
+            log_event(&format!(
                 "Preloaded {} MB of the cart in {:.1} s ({:.1} MB/s, {}){}",
                 bytes / MB,
                 secs,
                 bytes as f64 / MB as f64 / secs.max(0.001),
                 kind,
                 if cancelled { ", stopped when the game started" } else { "" },
-            );
+            ));
             if trace.is_some() && !cancelled {
                 let _ = fs::File::create(&ready_file);
             }
@@ -446,20 +450,81 @@ fn cached_ranges(path: &Path, size: u64) -> Vec<(u64, u64)> {
     ranges
 }
 
+/// Print the cached ranges of every file below `dir`, one `<file size> <offset> <length>
+/// <relative path>` line per range. Run as root through `kazeta-mount cache-ranges`: the kernel
+/// only tells the page cache state of files the caller may write or owns (otherwise mincore
+/// reports every page as cached), and cart files belong to whoever wrote the cart.
+pub fn print_cache_ranges(dir: Option<&str>) -> i32 {
+    let Some(dir) = dir else {
+        eprintln!("Usage: kazeta {} <cart directory>", CACHE_RANGES_ARG);
+        return 1;
+    };
+    let dir = fs::canonicalize(dir).unwrap_or_else(|_| PathBuf::from(dir));
+    let mut files = Vec::new();
+    cart_files(&dir, &mut files);
+    let mut out = String::new();
+    for (size, path) in files {
+        let Ok(relative) = path.strip_prefix(&dir) else { continue };
+        for (offset, len) in cached_ranges(&path, size) {
+            out.push_str(&format!("{} {} {} {}\n", size, offset, len, relative.display()));
+        }
+    }
+    print!("{}", out);
+    0
+}
+
+/// Cached ranges of the cart's files, as trace lines by relative path
+fn query_cache_ranges(cart_path: &Path) -> Option<String> {
+    // the kernel answers truthfully for root only, see print_cache_ranges; on other systems (for
+    // testing) the files are queried directly
+    if cfg!(target_os = "linux") && unsafe { libc::geteuid() } != 0 {
+        let output = Command::new("pkexec")
+            .args(["kazeta-mount", "cache-ranges"])
+            .arg(cart_path)
+            .output()
+            .map_err(|e| eprintln!("Failed to run kazeta-mount: {}", e))
+            .ok()?;
+        if !output.status.success() {
+            eprintln!("kazeta-mount cache-ranges failed: {}", output.status);
+            return None;
+        }
+        return String::from_utf8(output.stdout).ok();
+    }
+    let mut out = String::new();
+    let mut files = Vec::new();
+    cart_files(cart_path, &mut files);
+    for (size, path) in files {
+        let Ok(relative) = path.strip_prefix(cart_path) else { continue };
+        for (offset, len) in cached_ranges(&path, size) {
+            out.push_str(&format!("{} {} {} {}\n", size, offset, len, relative.display()));
+        }
+    }
+    Some(out)
+}
+
 /// Write down which parts of the cart are in the page cache: what the game has read so far
 fn record_trace(cart_path: &Path, cart_home: &Path, cart_exec: &str) {
     let cart_path = &fs::canonicalize(cart_path).unwrap_or_else(|_| cart_path.to_path_buf());
+    let Some(ranges) = query_cache_ranges(cart_path) else { return };
+    let mut by_path: HashMap<&str, Vec<&str>> = HashMap::new();
+    for line in ranges.lines() {
+        if let Some(path) = line.splitn(4, ' ').nth(3) {
+            by_path.entry(path).or_default().push(line);
+        }
+    }
+
     let mut trace = String::new();
     let mut total = 0;
     let mut count = 0;
     // same priority as the guess, so the files needed first are read first next time
     for path in preload_order(cart_path, cart_exec) {
         let Ok(relative) = path.strip_prefix(cart_path) else { continue };
-        let Ok(meta) = fs::metadata(&path) else { continue };
-        for (offset, len) in cached_ranges(&path, meta.len()) {
-            trace.push_str(&format!("{} {} {} {}\n", meta.len(), offset, len, relative.display()));
-            total += len;
+        let Some(lines) = by_path.get(relative.to_string_lossy().as_ref()) else { continue };
+        for line in lines {
+            total += line.split(' ').nth(2).and_then(|len| len.parse::<u64>().ok()).unwrap_or(0);
             count += 1;
+            trace.push_str(line);
+            trace.push('\n');
         }
     }
     if total > TRACE_MAX_BYTES {
@@ -470,9 +535,14 @@ fn record_trace(cart_path: &Path, cart_home: &Path, cart_exec: &str) {
     let file = trace_file(cart_home);
     let tmp = file.with_extension("trace.tmp");
     match fs::write(&tmp, trace).and_then(|_| fs::rename(&tmp, &file)) {
-        Ok(_) => eprintln!("Recorded preload trace: {} MB in {} ranges", total / MB, count),
+        Ok(_) => log_event(&format!("Recorded preload trace: {} MB in {} ranges", total / MB, count)),
         Err(e) => eprintln!("Failed to write {}: {}", file.display(), e),
     }
+}
+
+/// Log a step of starting a cart with the time, to measure where the boot time goes
+pub fn log_event(event: &str) {
+    eprintln!("[{}] {}", Local::now().format("%H:%M:%S%.3f"), event);
 }
 
 /// Records what the game read, TRACE_DELAY after it started, for the next preload. Only the

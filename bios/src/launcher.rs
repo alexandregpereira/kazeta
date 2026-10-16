@@ -318,7 +318,9 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         let _ = fs::remove_file(&ready_file);
         let mut prepared: Option<PreparedCart> = None;
         let status = run_bios(&resolution_gamescope_args(), last_cart.as_deref(), &stop, &mut |cart| {
+            intro::log_event(&format!("Cart handed over: {}", cart.display()));
             prepared = prepare_cart(cart, &base_dir, Some(&ready_file));
+            intro::log_event("Cart mounted, preloading");
             if prepared.is_none() {
                 // nothing to wait for, let the intro end
                 let _ = fs::File::create(&ready_file);
@@ -327,6 +329,9 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         let cart = fs::read_to_string(&boot_cart_file).ok().map(|path| PathBuf::from(path.trim()));
         let _ = fs::remove_file(&boot_cart_file);
         let _ = fs::remove_file(&ready_file);
+        if cart.is_some() {
+            intro::log_event("Bios exited");
+        }
 
         if terminated.get() {
             return 1;
@@ -473,6 +478,7 @@ fn play_cart(mut prepared: PreparedCart, stop: &dyn Fn() -> bool) -> i32 {
     let playtime = PlaytimeCapture::start(playtime_end);
 
     // records what the game reads at startup, for the next intro's preload
+    intro::log_event("Starting the game");
     let trace = intro::TraceRecorder::start(&prepared.cart_path, &cart_home, &prepared.cart_id, &prepared.cart_exec);
     let status = run_game(&cart_home, &prepared.cart_gsopts, &prepared.cart_exec_file, stop);
     drop(trace);
