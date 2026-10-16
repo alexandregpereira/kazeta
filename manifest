@@ -13,6 +13,8 @@ export BUG_REPORT_URL="https://github.com/kazetaos/kazeta/issues"
 export KERNEL_PACKAGE="linux"
 
 export PACKAGES="\
+	bluez \
+	bluez-utils \
 	fuse2 \
 	fuse3 \
 	gamescope \
@@ -48,9 +50,11 @@ export AUR_PACKAGES="\
 "
 
 export SERVICES="\
+	bluetooth \
 	fstrim.timer \
 	greetd \
 	inputplumber \
+	kazeta-bluetooth \
 	systemd-networkd \
 	systemd-resolved \
 "
@@ -107,6 +111,11 @@ postinstallhook() {
 	sed -i -e 's/- ds5-edge/- xbox-series/' /usr/share/inputplumber/devices/*.yaml
 	sed -i -e 's/- ds5/- xbox-series/' /usr/share/inputplumber/devices/*.yaml
 	sed -i -e 's/- 8bitdo-u2/- xbox-series/' /usr/share/inputplumber/devices/*.yaml
+
+	# Reconnect Bluetooth controllers faster, and let a controller that was paired with another
+	# system pair again without confirmation
+	sed -i -e 's/^#FastConnectable = false/FastConnectable = true/' /etc/bluetooth/main.conf
+	sed -i -e 's/^#JustWorksRepairing = never/JustWorksRepairing = always/' /etc/bluetooth/main.conf
 
 	# Create system users and avoid failure at runtime due to read-only file system
 	systemd-sysusers
