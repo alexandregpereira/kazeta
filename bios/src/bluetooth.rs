@@ -24,6 +24,8 @@ const REGISTER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 const PAIRING_WINDOW: Duration = Duration::from_secs(60);
 const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// Pairing a controller sometimes fails right after it shows up, so it is tried a few times
+const PAIR_ATTEMPTS: u32 = 3;
 
 const BUS_USB: u16 = 0x03;
 const BTN_GAMEPAD: usize = 0x130;
@@ -160,9 +162,10 @@ fn pairing_window(conn: &Connection) -> zbus::Result<()> {
     };
     let adapter = Proxy::new(conn, "org.bluez", adapter, "org.bluez.Adapter1")?;
     adapter.call::<_, _, ()>("StartDiscovery", &())?;
-    // discovery slows down the controllers already connected, so it is always stopped
-    let paired = pair_discovered_gamepad(conn, adapter.path());
-    adapter.call::<_, _, ()>("StopDiscovery", &())?;
+    let paired = pair_discovered_gamepad(conn, &adapter);
+    // discovery slows down the controllers already connected, so it is always stopped; it may
+    // already be stopped by a pairing attempt
+    let _ = adapter.call::<_, _, ()>("StopDiscovery", &());
     if !paired? {
         eprintln!("Bluetooth: pairing window closed, no gamepad paired");
     }
@@ -170,22 +173,29 @@ fn pairing_window(conn: &Connection) -> zbus::Result<()> {
 }
 
 /// Pair the first discovered gamepad that accepts it before the window closes
-fn pair_discovered_gamepad(conn: &Connection, adapter: &ObjectPath<'_>) -> zbus::Result<bool> {
+fn pair_discovered_gamepad(conn: &Connection, adapter: &Proxy<'_>) -> zbus::Result<bool> {
     let deadline = Instant::now() + PAIRING_WINDOW;
-    let mut tried: HashSet<OwnedObjectPath> = HashSet::new();
+    let mut attempts: HashMap<OwnedObjectPath, u32> = HashMap::new();
     while Instant::now() < deadline {
         thread::sleep(DISCOVERY_POLL_INTERVAL);
-        for device in unpaired_gamepads(conn, adapter)? {
-            if !tried.insert(device.clone()) {
+        for (device, name) in unpaired_gamepads(conn, adapter.path())? {
+            let attempt = attempts.entry(device.clone()).or_insert(0);
+            if *attempt >= PAIR_ATTEMPTS {
                 continue;
             }
+            *attempt += 1;
+            eprintln!("Bluetooth: pairing {} ({}), attempt {}", name, device, attempt);
+            // controllers often cancel the pairing while the adapter is still discovering
+            adapter.call::<_, _, ()>("StopDiscovery", &())?;
             match pair(conn, &device) {
                 Ok(()) => {
-                    eprintln!("Bluetooth: paired {}", device);
+                    eprintln!("Bluetooth: paired {} ({})", name, device);
                     return Ok(true);
                 }
                 Err(e) => eprintln!("Bluetooth: failed to pair {}: {}", device, e),
             }
+            adapter.call::<_, _, ()>("StartDiscovery", &())?;
+            break;
         }
     }
     Ok(false)
@@ -214,7 +224,8 @@ fn find_adapter(conn: &Connection) -> zbus::Result<Option<OwnedObjectPath>> {
     Ok(adapters.first().map(|path| (*path).clone()))
 }
 
-fn unpaired_gamepads(conn: &Connection, adapter: &ObjectPath<'_>) -> zbus::Result<Vec<OwnedObjectPath>> {
+/// Gamepads seen by the current discovery that are not paired yet, with their names
+fn unpaired_gamepads(conn: &Connection, adapter: &ObjectPath<'_>) -> zbus::Result<Vec<(OwnedObjectPath, String)>> {
     let objects = managed_objects(conn)?;
     Ok(objects
         .into_iter()
@@ -225,7 +236,14 @@ fn unpaired_gamepads(conn: &Connection, adapter: &ObjectPath<'_>) -> zbus::Resul
                 .and_then(|v| ObjectPath::try_from(&**v).ok())
                 .is_some_and(|p| p == *adapter);
             let paired = props.get("Paired").and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
-            (on_adapter && !paired && is_gamepad(props)).then_some(path)
+            // BlueZ keeps devices from earlier discoveries; only the ones found now have an RSSI
+            let in_range = props.contains_key("RSSI");
+            let name = props
+                .get("Name")
+                .and_then(|v| <&str>::try_from(&**v).ok())
+                .unwrap_or("unnamed")
+                .to_string();
+            (on_adapter && !paired && in_range && is_gamepad(props)).then_some((path, name))
         })
         .collect())
 }
