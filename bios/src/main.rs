@@ -13,6 +13,7 @@ use std::process;
 mod intro;
 mod launcher;
 mod power;
+mod preload;
 mod save;
 mod signals;
 mod volume;
@@ -1452,6 +1453,8 @@ fn main() {
             window_conf(),
             intro::run_intro(args.get(2).map(std::path::PathBuf::from).unwrap_or_else(intro::ready_file)),
         ),
+        // run as root by kazeta-mount to record what a game read, see preload::print_cache_ranges
+        Some(preload::CACHE_RANGES_ARG) => process::exit(preload::print_cache_ranges(args.get(2).map(String::as_str))),
         // run the given cart, or the bios which waits for one
         cart => process::exit(launcher::run(cart)),
     }

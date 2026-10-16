@@ -1,6 +1,7 @@
 // Boot intro: when a cart is handed over, the bios UI plays an animation of the logo with a boot
-// chime while the launcher mounts the cart. The launcher creates a ready file once the intro may
-// end, and the intro ends once it exists, after a minimum time.
+// chime while the launcher mounts the cart (and preloads it, see preload.rs). The launcher
+// creates a ready file once the intro may end, and the intro ends once it exists, after a
+// minimum time.
 
 use std::path::{Path, PathBuf};
 use std::process;
