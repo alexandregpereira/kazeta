@@ -370,6 +370,9 @@ struct PreparedCart {
     preload: Option<intro::Preload>,
     // unmounts the cart when dropped
     _cleanup: CartCleanup,
+    cart_path: PathBuf,
+    cart_id: String,
+    cart_exec: String,
     cart_home: PathBuf,
     cart_gsopts: Vec<String>,
     cart_exec_file: PathBuf,
@@ -429,7 +432,7 @@ fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Op
     cleanup.cart_home = Some(cart_home.clone());
 
     let cart_exec = attr("Exec");
-    let preload = ready_file.map(|ready_file| intro::Preload::start(&cart_path, &cart_exec, ready_file));
+    let preload = ready_file.map(|ready_file| intro::Preload::start(&cart_path, &cart_home, &cart_exec, ready_file));
     let cart_gsopts: Vec<String> = match attr("GamescopeOptions") {
         opts if opts.is_empty() => resolution_gamescope_args(),
         opts => opts.split_whitespace().map(String::from).collect(),
@@ -437,7 +440,7 @@ fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Op
     let cart_exec_file = cart_exec_file();
     let _ = fs::write(&cart_exec_file, format!("{}\n", cart_exec));
 
-    Some(PreparedCart { preload, _cleanup: cleanup, cart_home, cart_gsopts, cart_exec_file })
+    Some(PreparedCart { preload, _cleanup: cleanup, cart_path, cart_id, cart_exec, cart_home, cart_gsopts, cart_exec_file })
 }
 
 /// Run a prepared cart until the game exits or `stop` returns true, then unmount it
@@ -469,7 +472,10 @@ fn play_cart(mut prepared: PreparedCart, stop: &dyn Fn() -> bool) -> i32 {
     let _ = fs::write(&playtime_start, format!("{}\n", now_iso8601()));
     let playtime = PlaytimeCapture::start(playtime_end);
 
+    // records what the game reads at startup, for the next intro's preload
+    let trace = intro::TraceRecorder::start(&prepared.cart_path, &cart_home, &prepared.cart_id, &prepared.cart_exec);
     let status = run_game(&cart_home, &prepared.cart_gsopts, &prepared.cart_exec_file, stop);
+    drop(trace);
 
     playtime.stop();
     drop(prepared);

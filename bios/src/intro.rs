@@ -1,15 +1,18 @@
 // Boot intro: when a cart is handed over, the bios UI plays an animation of the logo with a boot
 // chime while the launcher mounts the cart and preloads it into the page cache, so the game
-// starts faster. The launcher creates a ready file once the preload is done, and the intro ends
-// once it exists.
+// starts faster. The launcher creates a ready file once the intro may end, and the intro ends
+// once it exists (after a minimum time). What the game reads is recorded once it has started,
+// and the next preload reads exactly that.
 
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use macroquad::prelude::*;
 
@@ -23,6 +26,13 @@ const PRELOAD_MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const PRELOAD_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 /// Files up to this size (executables, libraries, engine data) are read before the larger ones
 const PRELOAD_SMALL_FILE_BYTES: u64 = 64 * 1024 * 1024;
+/// How long after the game starts its reads are recorded for the next preload
+const TRACE_DELAY: Duration = Duration::from_secs(60);
+/// Cached ranges closer than this are merged, so they are read sequentially
+const TRACE_MERGE_GAP: u64 = 1024 * 1024;
+/// A larger trace is not recorded, it would hold more than what the game needs to start
+const TRACE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const MB: u64 = 1024 * 1024;
 const INTRO_BLACK: f64 = 0.4; // black screen before the logo when started on its own
 const INTRO_ENTER: f64 = 1.0; // logo moves to the center with a zoom pulse
 const INTRO_PULSE: f32 = 0.12; // extra zoom at the middle of the entrance
@@ -261,8 +271,8 @@ fn preload_order(cart_path: &Path, cart_exec: &str) -> Vec<PathBuf> {
     files.into_iter().map(|(_, path)| path).collect()
 }
 
-/// Read up to PRELOAD_MAX_BYTES of the cart so the game finds it in the page cache
-fn preload_cart(order: Vec<PathBuf>, cancel: &AtomicBool) {
+/// Read up to PRELOAD_MAX_BYTES of the cart's files, in `order`; returns the bytes read
+fn preload_files(order: Vec<PathBuf>, cancel: &AtomicBool) -> u64 {
     let mut budget = PRELOAD_MAX_BYTES;
     let mut buffer = vec![0u8; PRELOAD_CHUNK_SIZE];
     'files: for path in order {
@@ -278,26 +288,112 @@ fn preload_cart(order: Vec<PathBuf>, cancel: &AtomicBool) {
             }
         }
     }
-    eprintln!("Preloaded {} MB of the cart", (PRELOAD_MAX_BYTES - budget) / (1024 * 1024));
+    PRELOAD_MAX_BYTES - budget
 }
 
-/// Reads the cart into the page cache in the background while the intro plays
+/// A stretch of a cart file that the game read, from the trace
+struct TraceRange {
+    path: PathBuf,
+    offset: u64,
+    len: u64,
+}
+
+/// Where the trace of what a cart's game reads is kept: in its save data, so it survives reboots
+fn trace_file(cart_home: &Path) -> PathBuf {
+    cart_home.join(".kazeta/var/preload.trace")
+}
+
+/// Read the trace recorded for a cart, one `<file size> <offset> <length> <relative path>` line
+/// per range. Ranges of files that are gone or changed size (a re-flashed cart) are skipped.
+fn load_trace(cart_path: &Path, cart_home: &Path) -> Option<Vec<TraceRange>> {
+    let trace = fs::read_to_string(trace_file(cart_home)).ok()?;
+    let mut ranges = Vec::new();
+    for line in trace.lines() {
+        let mut fields = line.splitn(4, ' ');
+        let (Some(size), Some(offset), Some(len), Some(path)) = (fields.next(), fields.next(), fields.next(), fields.next()) else {
+            continue;
+        };
+        let (Ok(size), Ok(offset), Ok(len)) = (size.parse::<u64>(), offset.parse::<u64>(), len.parse::<u64>()) else {
+            continue;
+        };
+        let path = cart_path.join(path);
+        if fs::metadata(&path).is_ok_and(|meta| meta.len() == size) {
+            ranges.push(TraceRange { path, offset, len });
+        }
+    }
+    Some(ranges)
+}
+
+/// Read the traced ranges in order; returns the bytes read
+fn preload_trace(ranges: &[TraceRange], cancel: &AtomicBool) -> u64 {
+    let mut total = 0;
+    let mut buffer = vec![0u8; PRELOAD_CHUNK_SIZE];
+    let mut open: Option<(&Path, fs::File)> = None;
+    for range in ranges {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if open.as_ref().is_none_or(|(path, _)| *path != range.path) {
+            open = fs::File::open(&range.path).ok().map(|file| (range.path.as_path(), file));
+        }
+        let Some((_, file)) = open.as_mut() else { continue };
+        if file.seek(SeekFrom::Start(range.offset)).is_err() {
+            continue;
+        }
+        let mut remaining = range.len;
+        while remaining > 0 && !cancel.load(Ordering::Relaxed) {
+            let len = buffer.len().min(remaining as usize);
+            match file.read(&mut buffer[..len]) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    remaining -= n as u64;
+                    total += n as u64;
+                }
+            }
+        }
+    }
+    total
+}
+
+/// Reads the cart into the page cache in the background while the intro plays.
+/// With a trace of what the game read last time, exactly that is read and the intro waits for
+/// it. Without one, a guess is read (executables and engine files first) and the intro does not
+/// wait: reading more than the game needs from slow media only delays it.
 pub struct Preload {
     cancel: Arc<AtomicBool>,
     handle: Option<thread::JoinHandle<()>>,
 }
 
 impl Preload {
-    /// `ready_file` is created once the preload is done, so the intro may end
-    pub fn start(cart_path: &Path, cart_exec: &str, ready_file: &Path) -> Self {
+    /// `ready_file` is created once the intro may end; `cart_home` is the mounted cart
+    pub fn start(cart_path: &Path, cart_home: &Path, cart_exec: &str, ready_file: &Path) -> Self {
+        let trace = load_trace(cart_path, cart_home);
+        if trace.is_none() {
+            let _ = fs::File::create(ready_file);
+        }
+
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
         let cart_path = cart_path.to_path_buf();
         let cart_exec = cart_exec.to_string();
         let ready_file = ready_file.to_path_buf();
         let handle = thread::spawn(move || {
-            preload_cart(preload_order(&cart_path, &cart_exec), &thread_cancel);
-            if !thread_cancel.load(Ordering::Relaxed) {
+            let start = Instant::now();
+            let (bytes, kind) = match &trace {
+                Some(ranges) => (preload_trace(ranges, &thread_cancel), "trace"),
+                None => (preload_files(preload_order(&cart_path, &cart_exec), &thread_cancel), "guess"),
+            };
+            let cancelled = thread_cancel.load(Ordering::Relaxed);
+            let secs = start.elapsed().as_secs_f64();
+            eprintln!(
+                "Preloaded {} MB of the cart in {:.1} s ({:.1} MB/s, {}){}",
+                bytes / MB,
+                secs,
+                bytes as f64 / MB as f64 / secs.max(0.001),
+                kind,
+                if cancelled { ", stopped when the game started" } else { "" },
+            );
+            if trace.is_some() && !cancelled {
                 let _ = fs::File::create(&ready_file);
             }
         });
@@ -308,6 +404,115 @@ impl Preload {
 impl Drop for Preload {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Ranges of `path` that are in the page cache, as (offset, length), with ranges closer than
+/// TRACE_MERGE_GAP merged so they are read sequentially
+fn cached_ranges(path: &Path, size: u64) -> Vec<(u64, u64)> {
+    let mut ranges: Vec<(u64, u64)> = Vec::new();
+    let Ok(file) = fs::File::open(path) else { return ranges };
+    if size == 0 {
+        return ranges;
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let addr = unsafe {
+        libc::mmap(std::ptr::null_mut(), size as usize, libc::PROT_READ, libc::MAP_SHARED, file.as_raw_fd(), 0)
+    };
+    if addr == libc::MAP_FAILED {
+        return ranges;
+    }
+    let mut resident = vec![0u8; size.div_ceil(page) as usize];
+    let result = unsafe { libc::mincore(addr as _, size as usize, resident.as_mut_ptr() as _) };
+    unsafe { libc::munmap(addr, size as usize) };
+    if result != 0 {
+        return ranges;
+    }
+
+    for (index, flags) in resident.iter().enumerate() {
+        if flags & 1 == 0 {
+            continue;
+        }
+        let start = index as u64 * page;
+        let end = (start + page).min(size);
+        match ranges.last_mut() {
+            Some((offset, len)) if start - (*offset + *len) <= TRACE_MERGE_GAP => *len = end - *offset,
+            _ => ranges.push((start, end - start)),
+        }
+    }
+    ranges
+}
+
+/// Write down which parts of the cart are in the page cache: what the game has read so far
+fn record_trace(cart_path: &Path, cart_home: &Path, cart_exec: &str) {
+    let cart_path = &fs::canonicalize(cart_path).unwrap_or_else(|_| cart_path.to_path_buf());
+    let mut trace = String::new();
+    let mut total = 0;
+    let mut count = 0;
+    // same priority as the guess, so the files needed first are read first next time
+    for path in preload_order(cart_path, cart_exec) {
+        let Ok(relative) = path.strip_prefix(cart_path) else { continue };
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        for (offset, len) in cached_ranges(&path, meta.len()) {
+            trace.push_str(&format!("{} {} {} {}\n", meta.len(), offset, len, relative.display()));
+            total += len;
+            count += 1;
+        }
+    }
+    if total > TRACE_MAX_BYTES {
+        eprintln!("Not recording a preload trace of {} MB, over the limit", total / MB);
+        return;
+    }
+
+    let file = trace_file(cart_home);
+    let tmp = file.with_extension("trace.tmp");
+    match fs::write(&tmp, trace).and_then(|_| fs::rename(&tmp, &file)) {
+        Ok(_) => eprintln!("Recorded preload trace: {} MB in {} ranges", total / MB, count),
+        Err(e) => eprintln!("Failed to write {}: {}", file.display(), e),
+    }
+}
+
+/// Records what the game read, TRACE_DELAY after it started, for the next preload. Only the
+/// first game of a cart since boot is recorded, since the page cache then holds nothing else of
+/// it. The trace also holds what the preload itself read, so it can grow but does not shrink;
+/// deleting .kazeta/var/preload.trace from the save data starts it over.
+pub struct TraceRecorder {
+    stop: Option<mpsc::Sender<()>>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TraceRecorder {
+    pub fn start(cart_path: &Path, cart_home: &Path, cart_id: &str, cart_exec: &str) -> Option<Self> {
+        if cart_id.trim().is_empty() {
+            return None;
+        }
+        // in the runtime directory, which is emptied on every boot
+        let marker = launcher::runtime_dir().join(format!("kazeta-traced-{}", cart_id.trim().replace('/', "_")));
+        if marker.exists() {
+            return None;
+        }
+        let _ = fs::File::create(&marker);
+
+        let (stop, rx) = mpsc::channel::<()>();
+        let cart_path = cart_path.to_path_buf();
+        let cart_home = cart_home.to_path_buf();
+        let cart_exec = cart_exec.to_string();
+        let handle = thread::spawn(move || {
+            // nothing is recorded when the game exits before the delay
+            if let Err(mpsc::RecvTimeoutError::Timeout) = rx.recv_timeout(TRACE_DELAY) {
+                record_trace(&cart_path, &cart_home, &cart_exec);
+            }
+        });
+        Some(TraceRecorder { stop: Some(stop), handle: Some(handle) })
+    }
+}
+
+impl Drop for TraceRecorder {
+    fn drop(&mut self) {
+        drop(self.stop.take());
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
