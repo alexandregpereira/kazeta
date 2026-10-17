@@ -38,6 +38,7 @@ struct SoundEffects {
     reject: audio::Sound,
     back: audio::Sound,
     boot: audio::Sound,
+    cart_select: audio::Sound,
 }
 
 impl SoundEffects {
@@ -48,6 +49,7 @@ impl SoundEffects {
             reject: audio::load_sound_from_bytes(include_bytes!("../reject.wav")).await.unwrap(),
             back: audio::load_sound_from_bytes(include_bytes!("../back.wav")).await.unwrap(),
             boot: audio::load_sound_from_bytes(include_bytes!("../boot.wav")).await.unwrap(),
+            cart_select: audio::load_sound_from_bytes(include_bytes!("../cartselect.wav")).await.unwrap(),
         }
     }
 
@@ -76,6 +78,13 @@ impl SoundEffects {
         audio::play_sound(&self.boot, audio::PlaySoundParams {
             looped: false,
             volume: 1.0,
+        });
+    }
+
+    fn play_cart_select(&self) {
+        audio::play_sound(&self.cart_select, audio::PlaySoundParams {
+            looped: false,
+            volume: 0.6,
         });
     }
 
@@ -1448,7 +1457,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         // started by the launcher under gamescope
-        Some(launcher::UI_ARG) => macroquad::Window::from_config(window_conf(), bios_main(args.get(2).map(std::path::PathBuf::from))),
+        Some(launcher::UI_ARG) => macroquad::Window::from_config(window_conf(), bios_main(args.get(2).map(String::as_str) == Some(launcher::FROM_GAME_ARG))),
         // boot intro started by the launcher while it prepares a cart; ends once the ready file exists
         Some(intro::INTRO_ARG) => macroquad::Window::from_config(
             window_conf(),
@@ -1463,8 +1472,9 @@ fn main() {
     }
 }
 
-/// `ignored_cart` is the cart that was just played; it is not started again until it is removed
-async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
+/// `from_game` is set when a game was just played: the cart selection is shown then, even for a
+/// single cart, which is otherwise started by itself when it is inserted at startup
+async fn bios_main(from_game: bool) {
     let mut dialogs: Vec<Dialog> = Vec::new();
     let mut dialog_state = DialogState::None;
     let font = load_ttf_font_from_bytes(include_bytes!("../november.ttf")).unwrap();
@@ -1500,8 +1510,7 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
     const LOGO_FADE_IN_DURATION: f64 = 0.5;
     // minimum time the logo is shown at startup before an inserted cart is started
     const LOGO_MIN_DISPLAY_DURATION: f64 = 3.0;
-    // time on the launcher screen before prompting for a cart, and the prompt's blink period
-    const INSERT_CART_PROMPT_DELAY: f64 = 5.0;
+    // blink period of the prompt for a cart
     const INSERT_CART_BLINK_PERIOD: f64 = 1.0;
     // after this long without input the logo starts bouncing around the screen
     const LOGO_BOUNCE_IDLE_DELAY: f64 = 60.0;
@@ -1519,22 +1528,16 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
     // Watch for carts while the launcher or cart selection screen is shown
     let inserted_carts: Arc<Mutex<Vec<InsertedCart>>> = Arc::new(Mutex::new(Vec::new()));
     let cart_watch = Arc::new(AtomicBool::new(true));
+    // set once the inserted carts are known
+    let cart_scanned = Arc::new(AtomicBool::new(false));
     {
         let inserted_carts = inserted_carts.clone();
         let cart_watch = cart_watch.clone();
-        let mut ignored_cart = ignored_cart;
+        let cart_scanned = cart_scanned.clone();
         let mut known_carts: Vec<InsertedCart> = Vec::new();
         thread::spawn(move || loop {
-            let mut paths = Vec::new();
-            if cart_watch.load(Ordering::Relaxed) {
-                paths = launcher::find_carts();
-                // the media of the cart that was just played counts as removed until it is actually removed
-                if ignored_cart.as_ref().is_some_and(|ignored| paths.contains(ignored)) {
-                    paths.clear();
-                } else {
-                    ignored_cart = None;
-                }
-            }
+            let watching = cart_watch.load(Ordering::Relaxed);
+            let paths = if watching { launcher::find_carts() } else { Vec::new() };
             // only read cart info when the carts change, which may be slow on optical media
             if paths.len() != known_carts.len() || paths.iter().zip(&known_carts).any(|(path, cart)| *path != cart.path) {
                 known_carts = paths.into_iter()
@@ -1550,6 +1553,8 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                     *inserted = known_carts.clone();
                 }
             }
+            // cleared while not watching, so returning to the launcher does not show the empty list
+            cart_scanned.store(watching, Ordering::Relaxed);
             thread::sleep(time::Duration::from_millis(250));
         });
     }
@@ -1560,6 +1565,8 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
     let mut cart_select_leaving = false;
     let mut cart_chosen = false;
     let mut cart_icons: HashMap<std::path::PathBuf, Texture2D> = HashMap::new();
+    // only a single cart that is already inserted at startup is started without the selection
+    let mut auto_start = !from_game;
 
     // Create thread-safe storage media state
     let storage_state = Arc::new(Mutex::new(StorageMediaState::new()));
@@ -1681,6 +1688,10 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                 logo_alpha = ((get_time() - launcher_start_time) / LOGO_FADE_IN_DURATION).min(1.0) as f32;
                 let carts = inserted_carts.lock().map(|carts| carts.clone()).unwrap_or_default();
                 let cart_inserted = !carts.is_empty();
+                let scanned = cart_scanned.load(Ordering::Relaxed);
+                if scanned && !cart_inserted {
+                    auto_start = false;
+                }
 
                 // input or a cart ends the bouncing logo; the press that ends it does nothing else
                 let mut woken = false;
@@ -1715,10 +1726,12 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                     draw_texture(&logo, LOGO_X, logo_center_y, Color { a: logo_alpha, ..WHITE });
                 }
 
-                // a single cart starts right away, the intro takes over the logo where it is;
-                // with several carts the logo is shown for a minimum time before the selection
-                let logo_shown_long_enough = get_time() - launcher_start_time >= LOGO_MIN_DISPLAY_DURATION;
-                if carts.len() == 1 {
+                // a single cart inserted at startup starts right away, the intro takes over the logo
+                // where it is; otherwise the selection is shown, at startup after a minimum time
+                // with the logo and after a game once the logo has faded in
+                let logo_min_duration = if from_game { LOGO_FADE_IN_DURATION } else { LOGO_MIN_DISPLAY_DURATION };
+                let logo_shown_long_enough = get_time() - launcher_start_time >= logo_min_duration;
+                if carts.len() == 1 && auto_start {
                     if hand_over_cart(&carts[0].path) {
                         let from_pos = logo_bounce.take()
                             .map(|(position, _)| position.round())
@@ -1726,8 +1739,10 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                         intro = Some(intro::IntroAnimation::new(from_pos, logo_alpha, 1.0, 0.0));
                         current_screen = Screen::Intro;
                     }
-                } else if carts.len() > 1 && logo_shown_long_enough {
-                    // several games inserted, let the user pick one
+                } else if cart_inserted && logo_shown_long_enough {
+                    // let the user pick a game
+                    auto_start = false;
+                    sound_effects.play_cart_select();
                     cart_selection = 0;
                     cart_select_list = carts;
                     cart_select_reveal = 0.0;
@@ -1738,8 +1753,8 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                 }
 
                 let launcher_elapsed = get_time() - launcher_screen_time;
-                if !cart_inserted && logo_bounce.is_none() && launcher_elapsed >= INSERT_CART_PROMPT_DELAY {
-                    let blink_time = (launcher_elapsed - INSERT_CART_PROMPT_DELAY) % INSERT_CART_BLINK_PERIOD;
+                if scanned && !cart_inserted && logo_bounce.is_none() {
+                    let blink_time = launcher_elapsed % INSERT_CART_BLINK_PERIOD;
                     if blink_time < INSERT_CART_BLINK_PERIOD / 2.0 {
                         let text = "INSERT CART";
                         let text_width = measure_text(text, Some(&ctx.font), FONT_SIZE, 1.0).width;
@@ -1831,6 +1846,13 @@ async fn bios_main(ignored_cart: Option<std::path::PathBuf>) {
                         sound_effects.play_select();
                         cart_select_leaving = true;
                         cart_chosen = true;
+                    } else if input_state.back {
+                        // the way to the main menu while a cart is inserted; the logo is already in
+                        // place, only the menu fades in
+                        sound_effects.play_back();
+                        menu_reveal = LOGO_MOVE_DURATION;
+                        transition_to_menu = true;
+                        current_screen = Screen::MenuTransition;
                     }
                 }
             },
