@@ -291,7 +291,8 @@ impl PlaytimeCapture {
 
 /// Unmounts and tidies up after a cart, also when the launcher bails out early
 struct CartCleanup {
-    // kzp mount point, or the cart's own directory; unmounted either way like the original launcher
+    // kzp mount point; a cart info file's directory is not unmounted, it is the cart media's own
+    // mount point when the file is at its root, which nothing mounts again until the media is reinserted
     pkg_mount: Option<PathBuf>,
     mounted: Option<(PathBuf, PathBuf)>,
     upper: Option<PathBuf>,
@@ -441,7 +442,6 @@ fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Op
     } else {
         let cart_info = cart;
         let cart_path = cart_info.parent().unwrap_or(Path::new("/")).to_path_buf();
-        cleanup.pkg_mount = Some(cart_path.clone());
         (cart_info.clone(), cart_path.clone(), cart_path)
     };
 
