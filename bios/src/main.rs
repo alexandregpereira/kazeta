@@ -39,6 +39,7 @@ struct SoundEffects {
     back: audio::Sound,
     boot: audio::Sound,
     cart_select: audio::Sound,
+    cart_remove: audio::Sound,
 }
 
 impl SoundEffects {
@@ -50,6 +51,7 @@ impl SoundEffects {
             back: audio::load_sound_from_bytes(include_bytes!("../back.wav")).await.unwrap(),
             boot: audio::load_sound_from_bytes(include_bytes!("../boot.wav")).await.unwrap(),
             cart_select: audio::load_sound_from_bytes(include_bytes!("../cartselect.wav")).await.unwrap(),
+            cart_remove: audio::load_sound_from_bytes(include_bytes!("../cartremove.wav")).await.unwrap(),
         }
     }
 
@@ -83,6 +85,13 @@ impl SoundEffects {
 
     fn play_cart_select(&self) {
         audio::play_sound(&self.cart_select, audio::PlaySoundParams {
+            looped: false,
+            volume: 0.6,
+        });
+    }
+
+    fn play_cart_remove(&self) {
+        audio::play_sound(&self.cart_remove, audio::PlaySoundParams {
             looped: false,
             volume: 0.6,
         });
@@ -1794,6 +1803,7 @@ async fn bios_main(from_game: bool) {
                     let carts = inserted_carts.lock().map(|carts| carts.clone()).unwrap_or_default();
                     if carts.is_empty() {
                         // the carts were removed, go back to the logo
+                        sound_effects.play_cart_remove();
                         cart_select_leaving = true;
                     } else {
                         cart_select_list = carts;
