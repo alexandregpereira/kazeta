@@ -1,0 +1,13 @@
+[Unit]
+Description=Kazeta Bluetooth controller pairing
+Requires=bluetooth.service
+After=bluetooth.service
+PartOf=bluetooth.service
+
+[Service]
+ExecStart=/usr/bin/kazeta --bluetooth
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=bluetooth.target

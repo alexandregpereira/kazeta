@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicU16, Ordering, AtomicBool};
 use std::fs;
 use std::process;
 
+mod bluetooth;
 mod intro;
 mod launcher;
 mod power;
@@ -1455,6 +1456,8 @@ fn main() {
         ),
         // run as root by kazeta-mount to record what a game read, see preload::print_cache_ranges
         Some(preload::CACHE_RANGES_ARG) => process::exit(preload::print_cache_ranges(args.get(2).map(String::as_str))),
+        // run as root by kazeta-bluetooth.service to pair controllers, see bluetooth::run
+        Some(bluetooth::BLUETOOTH_ARG) => process::exit(bluetooth::run()),
         // run the given cart, or the bios which waits for one
         cart => process::exit(launcher::run(cart)),
     }
