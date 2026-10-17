@@ -7,6 +7,7 @@
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -30,9 +31,9 @@ pub const FROM_GAME_ARG: &str = "--from-game";
 const PLAYTIME_INTERVAL: Duration = Duration::from_secs(60);
 /// How long gamescope gets to exit after a termination signal before it is killed
 const GAMESCOPE_KILL_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long the bios gamescope gets to exit once the bios UI in it is done. Closing it can hang
+/// How long gamescope gets to exit once the bios UI or the game in it is done. Closing it can hang
 /// for the 25 s D-Bus timeout: libseat's "close device" call to logind sometimes gets no answer.
-const BIOS_GAMESCOPE_EXIT_GRACE: Duration = Duration::from_secs(2);
+const GAMESCOPE_EXIT_GRACE: Duration = Duration::from_secs(2);
 /// How long the game's output is still read after gamescope exited, in case a process that
 /// escaped its process group keeps the pipe open
 const LOG_WRITER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -204,7 +205,7 @@ fn run_bios(resolution_args: &[String], from_game: bool, stop: &dyn Fn() -> bool
             while matches!(child.try_wait(), Ok(None)) && !stop() {
                 match done_at {
                     None if bios_done_file.exists() => done_at = Some(std::time::Instant::now()),
-                    Some(at) if at.elapsed() > BIOS_GAMESCOPE_EXIT_GRACE => {
+                    Some(at) if at.elapsed() > GAMESCOPE_EXIT_GRACE => {
                         eprintln!("Bios gamescope did not exit after the bios, killing it");
                         unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
                         break;
@@ -576,7 +577,32 @@ fn run_game(cart_home: &Path, cart_gsopts: &[String], cart_exec_file: &Path, sto
         }
     }));
 
+    // once the game is done gamescope has nothing left to show; do not wait for it to finish
+    // closing if that hangs, the display would stay dark meanwhile. Killed, its devices are
+    // closed by the kernel and logind takes the display back by itself.
+    let mut game_started = false;
+    let mut done_at: Option<std::time::Instant> = None;
+    while matches!(child.try_wait(), Ok(None)) && !stop() {
+        if game_running(child.id()) {
+            game_started = true;
+        } else if game_started {
+            match done_at {
+                None => {
+                    log_event("Game done, waiting for gamescope to exit");
+                    done_at = Some(std::time::Instant::now());
+                }
+                Some(at) if at.elapsed() > GAMESCOPE_EXIT_GRACE => {
+                    eprintln!("Game gamescope did not exit after the game, killing it");
+                    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                    break;
+                }
+                _ => {}
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
     let status = signals::wait_child(&mut child, stop, GAMESCOPE_KILL_TIMEOUT);
+    log_event("Game gamescope exited");
     if let Some(log_writer) = log_writer {
         // the writer ends when every process holding the pipe has exited; do not hang on one
         // that escaped the process group, the thread is left behind instead
@@ -592,4 +618,26 @@ fn run_game(cart_home: &Path, cart_gsopts: &[String], cart_exec_file: &Path, sto
         Ok(status) => status.code().unwrap_or(1),
         Err(_) => 1,
     }
+}
+
+/// Whether the game started by the gamescope with process id `gamescope` is still running: gamescope
+/// runs it under a gamescopereaper child, which exits once the game and everything it started have
+/// exited, while gamescope itself may still be closing
+fn game_running(gamescope: u32) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        let path = entry.path();
+        // the parent id is the second field after the command name, which may contain spaces
+        let parent = fs::read_to_string(path.join("stat")).ok().and_then(|stat| {
+            stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
+        });
+        if parent != Some(gamescope) {
+            return false;
+        }
+        let cmdline = fs::read(path.join("cmdline")).unwrap_or_default();
+        let program = cmdline.split(|&b| b == 0).next().unwrap_or_default();
+        Path::new(std::ffi::OsStr::from_bytes(program)).file_name().is_some_and(|name| name == "gamescopereaper")
+    })
 }
