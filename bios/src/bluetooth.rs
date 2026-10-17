@@ -3,8 +3,8 @@
 // - an agent accepts every pairing and authorization request. BlueZ's sixaxis plugin asks it
 //   before pairing a DualShock 3 or 4 plugged in over USB, which is then paired by the cable alone.
 // - plugging a gamepad into USB, or starting with one plugged in, opens a pairing window: a
-//   gamepad put into pairing mode
-//   (e.g. Create + PS on a DualSense) is paired, trusted and connected on its own.
+//   gamepad put into pairing mode (e.g. Create + PS on a DualSense) is paired, trusted and
+//   connected on its own.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
