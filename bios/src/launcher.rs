@@ -25,6 +25,8 @@ use crate::volume;
 const NONE_RUNTIME: &str = "/usr/share/kazeta/runtimes/none.kzr";
 /// Argument the launcher starts the bios UI with under gamescope
 pub const UI_ARG: &str = "--ui";
+/// Passed to the bios UI after the argument above when it is started again after a game
+pub const FROM_GAME_ARG: &str = "--from-game";
 const PLAYTIME_INTERVAL: Duration = Duration::from_secs(60);
 /// How long gamescope gets to exit after a termination signal before it is killed
 const GAMESCOPE_KILL_TIMEOUT: Duration = Duration::from_secs(5);
@@ -166,18 +168,19 @@ fn pkexec_mount(args: &[&Path]) {
     }
 }
 
-/// Run the bios UI; `ignored_cart` is not started by it until it has been removed.
+/// Run the bios UI; `from_game` tells it a game was just played, so it shows the cart selection
+/// instead of starting a single inserted cart by itself.
 /// `on_cart` is called as soon as the UI hands over a cart, while it is still showing the intro.
-fn run_bios(resolution_args: &[String], ignored_cart: Option<&Path>, stop: &dyn Fn() -> bool, on_cart: &mut dyn FnMut(PathBuf)) -> i32 {
+fn run_bios(resolution_args: &[String], from_game: bool, stop: &dyn Fn() -> bool, on_cart: &mut dyn FnMut(PathBuf)) -> i32 {
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("kazeta"));
-    eprintln!("+ gamescope {:?} --filter pixel -- {} {} {:?}", resolution_args, exe.display(), UI_ARG, ignored_cart);
+    eprintln!("+ gamescope {:?} --filter pixel -- {} {} {}", resolution_args, exe.display(), UI_ARG, if from_game { FROM_GAME_ARG } else { "" });
     let child = Command::new("gamescope")
         .args(resolution_args)
         .args(orientation_gamescope_args())
         .args(["--filter", "pixel", "--"])
         .arg(exe)
         .arg(UI_ARG)
-        .args(ignored_cart)
+        .args(from_game.then_some(FROM_GAME_ARG))
         // own process group, so stopping it reaches everything it started
         .process_group(0)
         .spawn();
@@ -288,7 +291,8 @@ impl PlaytimeCapture {
 
 /// Unmounts and tidies up after a cart, also when the launcher bails out early
 struct CartCleanup {
-    // kzp mount point, or the cart's own directory; unmounted either way like the original launcher
+    // kzp mount point; a cart info file's directory is not unmounted, it is the cart media's own
+    // mount point when the file is at its root, which nothing mounts again until the media is reinserted
     pkg_mount: Option<PathBuf>,
     mounted: Option<(PathBuf, PathBuf)>,
     upper: Option<PathBuf>,
@@ -340,8 +344,8 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
     volume::watch();
     let power_key = power::watch();
     let stop = || terminated.get() || power_key.pressed();
-    // the cart that was just played, so the bios does not start it again right away
-    let mut last_cart: Option<PathBuf> = None;
+    // once a game was played the bios shows the cart selection instead of starting a cart by itself
+    let mut from_game = false;
     loop {
         // a press that stopped the game must not also shut down from the bios
         power_key.clear();
@@ -353,7 +357,7 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         let _ = fs::remove_file(&boot_cart_file);
         let _ = fs::remove_file(&ready_file);
         let mut prepared: Option<PreparedCart> = None;
-        let status = run_bios(&resolution_gamescope_args(), last_cart.as_deref(), &stop, &mut |cart| {
+        let status = run_bios(&resolution_gamescope_args(), from_game, &stop, &mut |cart| {
             log_event(&format!("Cart handed over: {}", cart.display()));
             prepared = prepare_cart(cart, &base_dir, Some(&ready_file));
             log_event("Cart mounted, preloading");
@@ -381,7 +385,7 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         };
 
         // a power button press stops the game and brings us back to the bios
-        let prepared = prepared.or_else(|| prepare_cart(cart.clone(), &base_dir, None));
+        let prepared = prepared.or_else(|| prepare_cart(cart, &base_dir, None));
         let status = match prepared {
             Some(prepared) if !stop() => play_cart(prepared, &stop),
             _ => 1,
@@ -390,7 +394,7 @@ pub fn run(cart_arg: Option<&str>) -> i32 {
         if terminated.get() {
             return 1;
         }
-        last_cart = Some(cart);
+        from_game = true;
     }
 }
 
@@ -438,7 +442,6 @@ fn prepare_cart(cart: PathBuf, base_dir: &Path, ready_file: Option<&Path>) -> Op
     } else {
         let cart_info = cart;
         let cart_path = cart_info.parent().unwrap_or(Path::new("/")).to_path_buf();
-        cleanup.pkg_mount = Some(cart_path.clone());
         (cart_info.clone(), cart_path.clone(), cart_path)
     };
 
