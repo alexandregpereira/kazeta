@@ -2,7 +2,8 @@
 // There is no UI, so pairing needs no confirmation:
 // - an agent accepts every pairing and authorization request. BlueZ's sixaxis plugin asks it
 //   before pairing a DualShock 3 or 4 plugged in over USB, which is then paired by the cable alone.
-// - plugging any gamepad into USB opens a pairing window: a gamepad put into pairing mode
+// - plugging a gamepad into USB, or starting with one plugged in, opens a pairing window: a
+//   gamepad put into pairing mode
 //   (e.g. Create + PS on a DualSense) is paired, trusted and connected on its own.
 
 use std::collections::{HashMap, HashSet};
@@ -24,6 +25,8 @@ const REGISTER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
 const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 const PAIRING_WINDOW: Duration = Duration::from_secs(60);
 const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+/// At boot the adapter may still be powering on when the window opens
+const ADAPTER_WAIT: Duration = Duration::from_secs(10);
 /// Pairing a controller sometimes fails right after it shows up, so it is tried a few times
 const PAIR_ATTEMPTS: u32 = 3;
 
@@ -89,8 +92,9 @@ pub fn run() -> i32 {
     }
     eprintln!("Bluetooth: pairing agent registered");
 
-    // gamepads already plugged in at startup do not open a window
-    let mut seen = usb_gamepads();
+    // gamepads already plugged in at startup open a window too, so starting with a wired
+    // controller is enough to pair another one
+    let mut seen = HashSet::new();
     loop {
         thread::sleep(RESCAN_INTERVAL);
         let current = usb_gamepads();
@@ -156,7 +160,7 @@ fn has_key(bitmap: &str, code: usize) -> bool {
 
 /// Discover for a while and pair the first gamepad found in pairing mode
 fn pairing_window(conn: &Connection) -> zbus::Result<()> {
-    let Some(adapter) = find_adapter(conn)? else {
+    let Some(adapter) = wait_for_adapter(conn)? else {
         eprintln!("Bluetooth: no powered adapter, not pairing");
         return Ok(());
     };
@@ -204,6 +208,17 @@ fn pair_discovered_gamepad(conn: &Connection, adapter: &Proxy<'_>) -> zbus::Resu
 fn managed_objects(conn: &Connection) -> zbus::Result<ManagedObjects> {
     let manager = Proxy::new(conn, "org.bluez", "/", "org.freedesktop.DBus.ObjectManager")?;
     manager.call("GetManagedObjects", &())
+}
+
+fn wait_for_adapter(conn: &Connection) -> zbus::Result<Option<OwnedObjectPath>> {
+    let deadline = Instant::now() + ADAPTER_WAIT;
+    loop {
+        let adapter = find_adapter(conn)?;
+        if adapter.is_some() || Instant::now() >= deadline {
+            return Ok(adapter);
+        }
+        thread::sleep(DISCOVERY_POLL_INTERVAL);
+    }
 }
 
 fn find_adapter(conn: &Connection) -> zbus::Result<Option<OwnedObjectPath>> {
