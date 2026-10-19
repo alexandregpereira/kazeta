@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time;
 use std::collections::HashMap;
-use gilrs::{Gilrs, Button, Axis};
+use gilrs::{Gilrs, GilrsBuilder, Button, Axis};
 use std::panic;
 use futures;
 use std::sync::atomic::{AtomicU16, Ordering, AtomicBool};
@@ -1503,8 +1503,9 @@ async fn bios_main(from_game: bool) {
     // Initialize sound effects
     let sound_effects = SoundEffects::new().await;
 
-    // Initialize gamepad support
-    let mut gilrs = Gilrs::new().unwrap();
+    // Initialize gamepad support. The bios never rumbles, and with force feedback on gilrs
+    // updates every gamepad's rumble every 50 ms, which floods InputPlumber's virtual pads
+    let mut gilrs = GilrsBuilder::new().with_force_feedback(false).build().unwrap();
     let mut input_state = InputState::new();
     let mut animation_state = AnimationState::new();
 
