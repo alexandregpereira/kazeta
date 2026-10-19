@@ -1,0 +1,128 @@
+diff --git a/src/drivers/dualsense/driver.rs b/src/drivers/dualsense/driver.rs
+index 4565f3f..f28ac29 100644
+--- a/src/drivers/dualsense/driver.rs
++++ b/src/drivers/dualsense/driver.rs
+@@ -1,7 +1,12 @@
+ use packed_struct::prelude::*;
+-use std::{error::Error, ffi::CString, time::Instant};
++use std::{
++    error::Error,
++    ffi::CString,
++    sync::atomic::{AtomicU8, Ordering},
++    time::Instant,
++};
+ 
+-use hidapi::HidDevice;
++use hidapi::{BusType, HidDevice};
+ 
+ use crate::drivers::dualsense::{
+     event::{BinaryInput, ButtonEvent, TriggerEvent, TriggerInput},
+@@ -14,9 +19,14 @@ use super::{
+         CalibrationReport, PackedInputDataReport, SetStatePackedOutputData, UsbPackedOutputReport,
+     },
+     DS5_ACCEL_RAW_TO_MPS2, DS5_GYRO_RAW_TO_RAD_S, DS5_VID, DS_FEATURE_REPORT_CALIBRATION_SIZE,
+-    FEATURE_REPORT_CALIBRATION, INPUT_REPORT_BT_SIZE, PIDS,
++    FEATURE_REPORT_CALIBRATION, INPUT_REPORT_BT_SIZE, OUTPUT_REPORT_BT, OUTPUT_REPORT_BT_SIZE, PIDS,
+ };
+ 
++/// Tag of the Bluetooth output report, after its report id and sequence number
++const OUTPUT_REPORT_BT_TAG: u8 = 0x10;
++/// Seed byte the Bluetooth output report CRC starts with
++const OUTPUT_REPORT_BT_CRC_SEED: u8 = 0xa2;
++
+ /// Linear per-axis calibration: `physical = (raw - bias) * scale`.
+ #[derive(Debug, Clone, Copy)]
+ pub struct AxisCalibration {
+@@ -143,6 +153,10 @@ pub struct Driver {
+     gyro_calibration: [AxisCalibration; 3],
+     /// X, y, z.
+     accel_calibration: [AxisCalibration; 3],
++    /// Connected over Bluetooth, which takes a different output report than USB
++    bluetooth: bool,
++    /// Sequence number of the Bluetooth output reports (0-15)
++    output_sequence: AtomicU8,
+ }
+ 
+ impl Driver {
+@@ -159,6 +173,7 @@ impl Driver {
+             );
+         }
+ 
++        let bluetooth = matches!(info.bus_type(), BusType::Bluetooth);
+         let (gyro_calibration, accel_calibration) = read_calibration(&device);
+ 
+         Ok(Self {
+@@ -169,6 +184,8 @@ impl Driver {
+             leds_initialized: false,
+             gyro_calibration,
+             accel_calibration,
++            bluetooth,
++            output_sequence: AtomicU8::new(0),
+         })
+     }
+ 
+@@ -203,6 +220,9 @@ impl Driver {
+         &self,
+         state: SetStatePackedOutputData,
+     ) -> Result<(), Box<dyn Error + Send + Sync>> {
++        if self.bluetooth {
++            return self.write_bluetooth(state);
++        }
+         let report = UsbPackedOutputReport {
+             state,
+             ..Default::default()
+@@ -213,6 +233,27 @@ impl Driver {
+         Ok(())
+     }
+ 
++    /// Writes the output state in the Bluetooth output report, which the controller ignores
++    /// unless it carries a sequence number and a CRC (as in the kernel's hid-playstation)
++    fn write_bluetooth(
++        &self,
++        state: SetStatePackedOutputData,
++    ) -> Result<(), Box<dyn Error + Send + Sync>> {
++        let sequence = self.output_sequence.fetch_add(1, Ordering::Relaxed) & 0x0f;
++        let mut buf = [0u8; OUTPUT_REPORT_BT_SIZE];
++        buf[0] = OUTPUT_REPORT_BT;
++        buf[1] = sequence << 4;
++        buf[2] = OUTPUT_REPORT_BT_TAG;
++        let state = state.pack()?;
++        buf[3..3 + state.len()].copy_from_slice(&state);
++        let crc_offset = OUTPUT_REPORT_BT_SIZE - 4;
++        let crc = crc32(&[&[OUTPUT_REPORT_BT_CRC_SEED], &buf[..crc_offset]]);
++        buf[crc_offset..].copy_from_slice(&crc.to_le_bytes());
++        let _bytes_written = self.device.write(&buf)?;
++
++        Ok(())
++    }
++
+     /// Release the LEDs from Wireless firmware control
+     /// When in wireless mode this must be signaled to control LEDs
+     /// This cannot be applied during the BT pair animation.
+@@ -537,3 +578,26 @@ impl Driver {
+         events
+     }
+ }
++
++/// CRC-32 (IEEE) of the given chunks, as used by the DualSense Bluetooth reports
++fn crc32(chunks: &[&[u8]]) -> u32 {
++    let mut crc = 0xffff_ffffu32;
++    for byte in chunks.iter().flat_map(|chunk| chunk.iter()) {
++        crc ^= *byte as u32;
++        for _ in 0..8 {
++            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
++        }
++    }
++    !crc
++}
++
++#[cfg(test)]
++mod tests {
++    use super::crc32;
++
++    #[test]
++    fn crc32_matches_ieee() {
++        assert_eq!(crc32(&[b"123456789"]), 0xcbf4_3926);
++        assert_eq!(crc32(&[b"1234", b"56789"]), 0xcbf4_3926);
++    }
++}
