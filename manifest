@@ -54,7 +54,6 @@ export SERVICES="\
 	fstrim.timer \
 	greetd \
 	inputplumber \
-	kazeta-bluetooth \
 	systemd-networkd \
 	systemd-resolved \
 "

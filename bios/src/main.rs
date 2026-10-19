@@ -162,6 +162,7 @@ enum Screen {
     MainMenu,
     SaveData,
     Display,
+    Bluetooth,
     CartSelect,
     Intro,
 }
@@ -1348,6 +1349,86 @@ fn render_display_menu(
     }
 }
 
+fn render_bluetooth_menu(
+    ctx: &DrawContext,
+    state: &bluetooth::State,
+    selected_option: usize,
+    confirm_forget: bool,
+    animation_state: &AnimationState,
+) {
+    const LIST_START_Y: f32 = 100.0;
+    const ROW_HEIGHT: f32 = 36.0;
+    const VISIBLE_ROWS: usize = 5;
+    const NAME_X: f32 = 110.0;
+    const TAG_RIGHT_X: f32 = 530.0;
+    const ROW_PADDING: f32 = 10.0;
+
+    draw_rectangle(0.0, 0.0, SCREEN_WIDTH as f32, SCREEN_HEIGHT as f32, UI_BG_COLOR);
+    let centered = |s: &str, y: f32| {
+        text(ctx, s, (SCREEN_WIDTH as f32 - measure_text(&s.to_uppercase(), Some(&ctx.font), FONT_SIZE, 1.0).width) / 2.0, y);
+    };
+    centered("BLUETOOTH", 60.0);
+
+    if !state.adapter {
+        centered("NO BLUETOOTH ADAPTER", 180.0);
+        centered("B: BACK", 330.0);
+        return;
+    }
+
+    if state.devices.is_empty() {
+        centered("NO CONTROLLERS FOUND", 150.0);
+    }
+    // keep the selected row in view
+    let first = selected_option.saturating_sub(VISIBLE_ROWS - 1);
+    for (row, (i, device)) in state.devices.iter().enumerate().skip(first).take(VISIBLE_ROWS).enumerate() {
+        let y_pos = LIST_START_Y + row as f32 * ROW_HEIGHT;
+        let tag = if device.connected { "CONNECTED" } else if device.paired { "PAIRED" } else { "NEW" };
+        let tag_width = measure_text(tag, Some(&ctx.font), FONT_SIZE, 1.0).width;
+        let name = fit_text(ctx, &device.name, TAG_RIGHT_X - tag_width - NAME_X - 20.0);
+
+        if i == selected_option {
+            let cursor_color = animation_state.get_cursor_color();
+            let cursor_scale = animation_state.get_cursor_scale();
+            let base_width = TAG_RIGHT_X - NAME_X + ROW_PADDING * 2.0;
+            // same margins as the main menu: 7 above the text, 9 below the baseline
+            let base_height = FONT_SIZE as f32 + 16.0;
+            let scaled_width = base_width * cursor_scale;
+            let scaled_height = base_height * cursor_scale;
+            let box_x = NAME_X - ROW_PADDING - (scaled_width - base_width) / 2.0;
+            let box_y = y_pos - FONT_SIZE as f32 - 7.0 - (scaled_height - base_height) / 2.0;
+            draw_rectangle_lines(box_x, box_y, scaled_width, scaled_height, 4.0, cursor_color);
+        }
+        text(ctx, &name, NAME_X, y_pos);
+        if device.paired {
+            text(ctx, tag, TAG_RIGHT_X - tag_width, y_pos);
+        } else {
+            text_disabled(ctx, tag, TAG_RIGHT_X - tag_width, y_pos);
+        }
+    }
+
+    if let Some(name) = &state.pairing {
+        centered(&format!("PAIRING {}...", name), 300.0);
+    } else if let Some(status) = &state.status {
+        centered(status, 300.0);
+    } else {
+        centered("TO ADD A CONTROLLER, PUT IT IN PAIRING MODE", 300.0);
+    }
+
+    let selected = state.devices.get(selected_option);
+    let controls = if state.pairing.is_some() {
+        "B: BACK"
+    } else if confirm_forget {
+        "FORGET THIS DEVICE?  A: YES  B: NO"
+    } else if selected.is_some_and(|d| d.paired) {
+        "A: FORGET  B: BACK"
+    } else if selected.is_some() {
+        "A: PAIR  B: BACK"
+    } else {
+        "B: BACK"
+    };
+    centered(controls, 330.0);
+}
+
 /// Hand a cart to the launcher, which starts it once the bios exits
 fn hand_over_cart(cart: &std::path::Path) -> bool {
     let boot_cart_file = launcher::boot_cart_file();
@@ -1474,8 +1555,6 @@ fn main() {
         ),
         // run as root by kazeta-mount to record what a game read, see preload::print_cache_ranges
         Some(preload::CACHE_RANGES_ARG) => process::exit(preload::print_cache_ranges(args.get(2).map(String::as_str))),
-        // run as root by kazeta-bluetooth.service to pair controllers, see bluetooth::run
-        Some(bluetooth::BLUETOOTH_ARG) => process::exit(bluetooth::run()),
         // run the given cart, or the bios which waits for one
         cart => process::exit(launcher::run(cart)),
     }
@@ -1510,11 +1589,15 @@ async fn bios_main(from_game: bool) {
     let mut animation_state = AnimationState::new();
 
     // Screen state
-    const MAIN_MENU_OPTIONS: [&str; 2] = ["DATA", "DISPLAY"];
+    const MAIN_MENU_OPTIONS: [&str; 3] = ["DATA", "DISPLAY", "BLUETOOTH"];
     let mut current_screen = Screen::Launcher;
     let mut main_menu_selection: usize = 0;
     let mut display_menu_selection: usize = 0;
     let mut active_resolution: usize = load_resolution_setting();
+    // started the first time the BLUETOOTH screen is opened
+    let mut bluetooth_manager: Option<bluetooth::Manager> = None;
+    let mut bluetooth_selection: usize = 0;
+    let mut bluetooth_confirm_forget = false;
 
     // Launcher screen state
     const LOGO_FADE_IN_DURATION: f64 = 0.5;
@@ -1910,6 +1993,13 @@ async fn bios_main(from_game: bool) {
                             display_menu_selection = active_resolution;
                             sound_effects.play_select();
                         },
+                        2 => {
+                            current_screen = Screen::Bluetooth;
+                            bluetooth_selection = 0;
+                            bluetooth_confirm_forget = false;
+                            bluetooth_manager.get_or_insert_with(bluetooth::Manager::new).open();
+                            sound_effects.play_select();
+                        },
                         _ => {}
                     }
                 } else if input_state.back {
@@ -1942,6 +2032,56 @@ async fn bios_main(from_game: bool) {
                 }
                 if input_state.back {
                     current_screen = Screen::MainMenu;
+                    sound_effects.play_back();
+                }
+            },
+            Screen::Bluetooth => {
+                let manager = bluetooth_manager.get_or_insert_with(bluetooth::Manager::new);
+                let state = manager.state();
+                if bluetooth_selection >= state.devices.len() {
+                    bluetooth_selection = state.devices.len().saturating_sub(1);
+                    bluetooth_confirm_forget = false;
+                }
+                render_bluetooth_menu(&ctx, &state, bluetooth_selection, bluetooth_confirm_forget, &animation_state);
+
+                let busy = state.pairing.is_some();
+                let count = state.devices.len();
+                if !busy && !bluetooth_confirm_forget && count > 0 && (input_state.up || input_state.down) {
+                    bluetooth_selection = if input_state.up {
+                        (bluetooth_selection + count - 1) % count
+                    } else {
+                        (bluetooth_selection + 1) % count
+                    };
+                    animation_state.trigger_transition();
+                    sound_effects.play_cursor_move();
+                }
+                if input_state.select && !busy {
+                    match state.devices.get(bluetooth_selection) {
+                        Some(device) if bluetooth_confirm_forget => {
+                            manager.forget(device);
+                            bluetooth_confirm_forget = false;
+                            sound_effects.play_select();
+                        }
+                        Some(device) if device.paired => {
+                            bluetooth_confirm_forget = true;
+                            sound_effects.play_select();
+                        }
+                        Some(device) => {
+                            manager.pair(device);
+                            sound_effects.play_select();
+                        }
+                        None => sound_effects.play_reject(),
+                    }
+                } else if input_state.select {
+                    sound_effects.play_reject();
+                }
+                if input_state.back {
+                    if bluetooth_confirm_forget {
+                        bluetooth_confirm_forget = false;
+                    } else {
+                        manager.close();
+                        current_screen = Screen::MainMenu;
+                    }
                     sound_effects.play_back();
                 }
             },

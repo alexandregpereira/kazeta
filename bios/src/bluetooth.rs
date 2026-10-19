@@ -1,37 +1,33 @@
-// Bluetooth controller pairing for Kazeta OS, run as root by kazeta-bluetooth.service.
-// There is no UI, so pairing needs no confirmation:
-// - an agent accepts every pairing and authorization request. BlueZ's sixaxis plugin asks it
-//   before pairing a DualShock 3 or 4 plugged in over USB, which is then paired by the cable alone.
-// - plugging a gamepad into USB, or starting with one plugged in, opens a pairing window: a
-//   gamepad put into pairing mode (e.g. Create + PS on a DualSense) is paired, trusted and
-//   connected on its own.
+// Bluetooth controller pairing for Kazeta OS, used by the bios BLUETOOTH screen as the session
+// user (BlueZ lets any user call it). While the screen is open it discovers, lists the paired
+// devices and the gamepads found in pairing mode, pairs those on its own (they can be picked again
+// if it failed) and forgets paired ones.
+// There is no UI for pairing requests, so it registers an agent that accepts every pairing and
+// authorization request, as the default agent: BlueZ's sixaxis plugin asks the default agent
+// before pairing a DualShock 3 or 4 plugged in over USB, which is then paired by the cable alone.
 
-use std::collections::{HashMap, HashSet};
-use std::fs;
+use std::collections::HashMap;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use zbus::blocking::{Connection, Proxy};
 use zbus::zvariant::{ObjectPath, OwnedObjectPath, OwnedValue};
 
-/// Argument that runs the pairing service, see run
-pub const BLUETOOTH_ARG: &str = "--bluetooth";
-
 const AGENT_PATH: &str = "/org/kazeta/agent";
 const AGENT_CAPABILITY: &str = "NoInputNoOutput";
 const PIN_CODE: &str = "0000";
 const REGISTER_ATTEMPTS: u32 = 20;
 const REGISTER_RETRY_INTERVAL: Duration = Duration::from_millis(500);
-const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
-const PAIRING_WINDOW: Duration = Duration::from_secs(60);
-const DISCOVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
-/// At boot the adapter may still be powering on when the window opens
-const ADAPTER_WAIT: Duration = Duration::from_secs(10);
-/// Pairing a controller sometimes fails right after it shows up, so it is tried a few times
-const PAIR_ATTEMPTS: u32 = 3;
+/// How often the screen's device list is read from BlueZ
+const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a pairing result stays on the screen
+const STATUS_DURATION: Duration = Duration::from_secs(4);
+/// Times a gamepad found in pairing mode is paired on its own each time the screen is opened, so
+/// one that refuses does not keep the adapter busy
+const AUTO_PAIR_ATTEMPTS: u32 = 2;
 
-const BUS_USB: u16 = 0x03;
-const BTN_GAMEPAD: usize = 0x130;
 /// Class of device: peripheral major class, joystick or gamepad minor class
 const COD_MAJOR_PERIPHERAL: u32 = 0x05;
 const COD_MINOR_JOYSTICK: u32 = 0x01;
@@ -77,38 +73,7 @@ impl Agent {
     fn cancel(&self) {}
 }
 
-/// Register the agent and open a pairing window whenever a gamepad is plugged into USB
-pub fn run() -> i32 {
-    let conn = match Connection::system() {
-        Ok(conn) => conn,
-        Err(e) => {
-            eprintln!("Bluetooth: failed to connect to the system bus: {}", e);
-            return 1;
-        }
-    };
-    if let Err(e) = register_agent(&conn) {
-        eprintln!("Bluetooth: failed to register the pairing agent: {}", e);
-        return 1;
-    }
-    eprintln!("Bluetooth: pairing agent registered");
-
-    // gamepads already plugged in at startup open a window too, so starting with a wired
-    // controller is enough to pair another one
-    let mut seen = HashSet::new();
-    loop {
-        thread::sleep(RESCAN_INTERVAL);
-        let current = usb_gamepads();
-        if let Some(name) = current.difference(&seen).next() {
-            eprintln!("Bluetooth: gamepad plugged into USB ({}), opening the pairing window", name);
-            if let Err(e) = pairing_window(&conn) {
-                eprintln!("Bluetooth: pairing window failed: {}", e);
-            }
-        }
-        // devices plugged in during the window are taken as seen, they had the window open
-        seen = usb_gamepads();
-    }
-}
-
+/// Register the agent as the default one, which also answers the requests no pairing call started
 fn register_agent(conn: &Connection) -> zbus::Result<()> {
     conn.object_server().at(AGENT_PATH, Agent)?;
     let manager = Proxy::new(conn, "org.bluez", "/org/bluez", "org.bluez.AgentManager1")?;
@@ -129,80 +94,197 @@ fn register_agent(conn: &Connection) -> zbus::Result<()> {
     manager.call::<_, _, ()>("RequestDefaultAgent", &(&path,))
 }
 
-/// Input device names (e.g. event5) of the gamepads connected over USB, read from sysfs so the
-/// devices are not opened
-fn usb_gamepads() -> HashSet<String> {
-    let Ok(entries) = fs::read_dir("/sys/class/input") else { return HashSet::new() };
-    entries
-        .flatten()
-        .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|name| name.starts_with("event"))
-        .filter(|name| {
-            let device = format!("/sys/class/input/{}/device", name);
-            let bus = fs::read_to_string(format!("{}/id/bustype", device))
-                .ok()
-                .and_then(|s| u16::from_str_radix(s.trim(), 16).ok());
-            let keys = fs::read_to_string(format!("{}/capabilities/key", device)).unwrap_or_default();
-            bus == Some(BUS_USB) && has_key(&keys, BTN_GAMEPAD)
-        })
-        .collect()
+/// A device shown on the BLUETOOTH screen
+#[derive(Clone, Debug)]
+pub struct Device {
+    pub path: OwnedObjectPath,
+    pub name: String,
+    pub paired: bool,
+    pub connected: bool,
 }
 
-/// Whether a sysfs key capability bitmap (hex words, most significant first) has the key code
-fn has_key(bitmap: &str, code: usize) -> bool {
-    let bits = usize::BITS as usize;
-    let words: Vec<&str> = bitmap.split_whitespace().rev().collect();
-    words
-        .get(code / bits)
-        .and_then(|word| usize::from_str_radix(word, 16).ok())
-        .is_some_and(|word| word & (1 << (code % bits)) != 0)
+/// What the BLUETOOTH screen shows, updated by the manager thread
+#[derive(Clone, Debug, Default)]
+pub struct State {
+    /// false when there is no powered adapter
+    pub adapter: bool,
+    /// paired devices first, then the gamepads found in pairing mode
+    pub devices: Vec<Device>,
+    /// name of the device being paired
+    pub pairing: Option<String>,
+    /// result of the last pairing or forget, shown for a while
+    pub status: Option<String>,
 }
 
-/// Discover for a while and pair the first gamepad found in pairing mode
-fn pairing_window(conn: &Connection) -> zbus::Result<()> {
-    let Some(adapter) = wait_for_adapter(conn)? else {
-        eprintln!("Bluetooth: no powered adapter, not pairing");
-        return Ok(());
-    };
-    let adapter = Proxy::new(conn, "org.bluez", adapter, "org.bluez.Adapter1")?;
-    adapter.call::<_, _, ()>("StartDiscovery", &())?;
-    let paired = pair_discovered_gamepad(conn, &adapter);
-    // discovery slows down the controllers already connected, so it is always stopped; it may
-    // already be stopped by a pairing attempt
-    let _ = adapter.call::<_, _, ()>("StopDiscovery", &());
-    if !paired? {
-        eprintln!("Bluetooth: pairing window closed, no gamepad paired");
+enum Command {
+    StartDiscovery,
+    StopDiscovery,
+    Pair(Device),
+    Forget(Device),
+}
+
+/// Talks to BlueZ from a background thread, since pairing blocks for many seconds
+pub struct Manager {
+    commands: Sender<Command>,
+    state: Arc<Mutex<State>>,
+}
+
+impl Manager {
+    pub fn new() -> Self {
+        let (commands, rx) = mpsc::channel();
+        let state = Arc::new(Mutex::new(State::default()));
+        let thread_state = state.clone();
+        thread::spawn(move || manager_thread(rx, thread_state));
+        Manager { commands, state }
     }
-    Ok(())
+
+    /// Start discovering, while the screen is open
+    pub fn open(&self) {
+        let _ = self.commands.send(Command::StartDiscovery);
+    }
+
+    /// Stop discovering, which slows down the controllers already connected
+    pub fn close(&self) {
+        let _ = self.commands.send(Command::StopDiscovery);
+    }
+
+    pub fn pair(&self, device: &Device) {
+        let _ = self.commands.send(Command::Pair(device.clone()));
+    }
+
+    pub fn forget(&self, device: &Device) {
+        let _ = self.commands.send(Command::Forget(device.clone()));
+    }
+
+    pub fn state(&self) -> State {
+        self.state.lock().map(|state| state.clone()).unwrap_or_default()
+    }
 }
 
-/// Pair the first discovered gamepad that accepts it before the window closes
-fn pair_discovered_gamepad(conn: &Connection, adapter: &Proxy<'_>) -> zbus::Result<bool> {
-    let deadline = Instant::now() + PAIRING_WINDOW;
-    let mut attempts: HashMap<OwnedObjectPath, u32> = HashMap::new();
-    while Instant::now() < deadline {
-        thread::sleep(DISCOVERY_POLL_INTERVAL);
-        for (device, name) in unpaired_gamepads(conn, adapter.path())? {
-            let attempt = attempts.entry(device.clone()).or_insert(0);
-            if *attempt >= PAIR_ATTEMPTS {
-                continue;
+fn manager_thread(rx: Receiver<Command>, state: Arc<Mutex<State>>) {
+    let conn = match Connection::system() {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("Bluetooth: failed to connect to the system bus: {}", e);
+            return;
+        }
+    };
+    // BlueZ drops the agent when the bios exits
+    if let Err(e) = register_agent(&conn) {
+        eprintln!("Bluetooth: failed to register the pairing agent: {}", e);
+    }
+    let mut discovering = false;
+    let mut status_since = Instant::now();
+    let mut pair_attempts: HashMap<OwnedObjectPath, u32> = HashMap::new();
+    let mut auto_pair: Option<Device> = None;
+    loop {
+        let command = match auto_pair.take() {
+            Some(device) => Ok(Command::Pair(device)),
+            None => rx.recv_timeout(REFRESH_INTERVAL),
+        };
+        match command {
+            Ok(Command::StartDiscovery) => {
+                discovering = true;
+                pair_attempts.clear();
+                set_discovery(&conn, true);
             }
-            *attempt += 1;
-            eprintln!("Bluetooth: pairing {} ({}), attempt {}", name, device, attempt);
-            // controllers often cancel the pairing while the adapter is still discovering
-            adapter.call::<_, _, ()>("StopDiscovery", &())?;
-            match pair(conn, &device) {
-                Ok(()) => {
-                    eprintln!("Bluetooth: paired {} ({})", name, device);
-                    return Ok(true);
+            Ok(Command::StopDiscovery) => {
+                discovering = false;
+                set_discovery(&conn, false);
+            }
+            Ok(Command::Pair(device)) => {
+                *pair_attempts.entry(device.path.clone()).or_insert(0) += 1;
+                update(&state, |s| s.pairing = Some(device.name.clone()));
+                // controllers often cancel the pairing while the adapter is still discovering
+                set_discovery(&conn, false);
+                let status = match pair(&conn, &device.path) {
+                    Ok(()) => {
+                        eprintln!("Bluetooth: paired {} ({})", device.name, device.path);
+                        format!("{} PAIRED", device.name)
+                    }
+                    Err(e) => {
+                        eprintln!("Bluetooth: failed to pair {}: {}", device.path, e);
+                        format!("COULD NOT PAIR {}", device.name)
+                    }
+                };
+                // the screen may have been closed while pairing
+                discovering = discovering && still_open(&rx);
+                if discovering {
+                    set_discovery(&conn, true);
                 }
-                Err(e) => eprintln!("Bluetooth: failed to pair {}: {}", device, e),
+                update(&state, |s| {
+                    s.pairing = None;
+                    s.status = Some(status);
+                });
+                status_since = Instant::now();
             }
-            adapter.call::<_, _, ()>("StartDiscovery", &())?;
-            break;
+            Ok(Command::Forget(device)) => {
+                let status = match forget(&conn, &device.path) {
+                    Ok(()) => format!("{} FORGOTTEN", device.name),
+                    Err(e) => {
+                        eprintln!("Bluetooth: failed to forget {}: {}", device.path, e);
+                        format!("COULD NOT FORGET {}", device.name)
+                    }
+                };
+                update(&state, |s| s.status = Some(status));
+                status_since = Instant::now();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+
+        let (adapter, devices) = match list_devices(&conn) {
+            Ok(result) => result,
+            Err(e) => {
+                eprintln!("Bluetooth: failed to list devices: {}", e);
+                (false, Vec::new())
+            }
+        };
+        if discovering {
+            auto_pair = devices
+                .iter()
+                .find(|d| !d.paired && pair_attempts.get(&d.path).copied().unwrap_or(0) < AUTO_PAIR_ATTEMPTS)
+                .cloned();
+        }
+        let clear_status = status_since.elapsed() >= STATUS_DURATION;
+        update(&state, |s| {
+            s.adapter = adapter;
+            s.devices = devices;
+            if clear_status {
+                s.status = None;
+            }
+        });
+    }
+}
+
+/// Whether the screen is still open after the commands sent while pairing
+fn still_open(rx: &Receiver<Command>) -> bool {
+    let mut open = true;
+    while let Ok(command) = rx.try_recv() {
+        match command {
+            Command::StartDiscovery => open = true,
+            Command::StopDiscovery => open = false,
+            // the screen offers no pairing or forgetting while pairing
+            Command::Pair(_) | Command::Forget(_) => {}
         }
     }
-    Ok(false)
+    open
+}
+
+fn update(state: &Arc<Mutex<State>>, f: impl FnOnce(&mut State)) {
+    if let Ok(mut state) = state.lock() {
+        f(&mut state);
+    }
+}
+
+fn set_discovery(conn: &Connection, on: bool) {
+    let Ok(Some(adapter)) = find_adapter(conn) else { return };
+    let Ok(adapter) = Proxy::new(conn, "org.bluez", adapter, "org.bluez.Adapter1") else { return };
+    let method = if on { "StartDiscovery" } else { "StopDiscovery" };
+    // fails harmlessly when discovery is already in that state
+    if let Err(e) = adapter.call::<_, _, ()>(method, &()) {
+        eprintln!("Bluetooth: {} failed: {}", method, e);
+    }
 }
 
 fn managed_objects(conn: &Connection) -> zbus::Result<ManagedObjects> {
@@ -210,19 +292,11 @@ fn managed_objects(conn: &Connection) -> zbus::Result<ManagedObjects> {
     manager.call("GetManagedObjects", &())
 }
 
-fn wait_for_adapter(conn: &Connection) -> zbus::Result<Option<OwnedObjectPath>> {
-    let deadline = Instant::now() + ADAPTER_WAIT;
-    loop {
-        let adapter = find_adapter(conn)?;
-        if adapter.is_some() || Instant::now() >= deadline {
-            return Ok(adapter);
-        }
-        thread::sleep(DISCOVERY_POLL_INTERVAL);
-    }
+fn find_adapter(conn: &Connection) -> zbus::Result<Option<OwnedObjectPath>> {
+    Ok(powered_adapter(&managed_objects(conn)?))
 }
 
-fn find_adapter(conn: &Connection) -> zbus::Result<Option<OwnedObjectPath>> {
-    let objects = managed_objects(conn)?;
+fn powered_adapter(objects: &ManagedObjects) -> Option<OwnedObjectPath> {
     let mut adapters: Vec<&OwnedObjectPath> = objects
         .iter()
         .filter(|(_, interfaces)| {
@@ -236,31 +310,37 @@ fn find_adapter(conn: &Connection) -> zbus::Result<Option<OwnedObjectPath>> {
         .collect();
     // hci0 first when there are several adapters
     adapters.sort_by(|a, b| a.as_str().cmp(b.as_str()));
-    Ok(adapters.first().map(|path| (*path).clone()))
+    adapters.first().map(|path| (*path).clone())
 }
 
-/// Gamepads seen by the current discovery that are not paired yet, with their names
-fn unpaired_gamepads(conn: &Connection, adapter: &ObjectPath<'_>) -> zbus::Result<Vec<(OwnedObjectPath, String)>> {
+/// Whether there is a powered adapter, and its paired devices followed by the gamepads in
+/// pairing mode
+fn list_devices(conn: &Connection) -> zbus::Result<(bool, Vec<Device>)> {
     let objects = managed_objects(conn)?;
-    Ok(objects
+    let Some(adapter) = powered_adapter(&objects) else { return Ok((false, Vec::new())) };
+    let mut devices: Vec<Device> = objects
         .into_iter()
         .filter_map(|(path, interfaces)| {
             let props = interfaces.get("org.bluez.Device1")?;
             let on_adapter = props
                 .get("Adapter")
                 .and_then(|v| ObjectPath::try_from(&**v).ok())
-                .is_some_and(|p| p == *adapter);
-            let paired = props.get("Paired").and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
+                .is_some_and(|p| p.as_str() == adapter.as_str());
+            let flag = |name: &str| props.get(name).and_then(|v| bool::try_from(v).ok()).unwrap_or(false);
+            let paired = flag("Paired");
             // BlueZ keeps devices from earlier discoveries; only the ones found now have an RSSI
             let in_range = props.contains_key("RSSI");
-            let name = props
-                .get("Name")
-                .and_then(|v| <&str>::try_from(&**v).ok())
+            let shown = paired || (in_range && is_gamepad(props));
+            let name = ["Alias", "Name"]
+                .iter()
+                .find_map(|key| props.get(*key).and_then(|v| <&str>::try_from(&**v).ok()))
                 .unwrap_or("unnamed")
                 .to_string();
-            (on_adapter && !paired && in_range && is_gamepad(props)).then_some((path, name))
+            (on_adapter && shown).then(|| Device { path, name, paired, connected: flag("Connected") })
         })
-        .collect())
+        .collect();
+    devices.sort_by(|a, b| b.paired.cmp(&a.paired).then_with(|| a.name.cmp(&b.name)));
+    Ok((true, devices))
 }
 
 fn is_gamepad(props: &HashMap<String, OwnedValue>) -> bool {
@@ -281,4 +361,12 @@ fn pair(conn: &Connection, device: &OwnedObjectPath) -> zbus::Result<()> {
     proxy.call::<_, _, ()>("Pair", &())?;
     proxy.set_property("Trusted", true)?;
     proxy.call::<_, _, ()>("Connect", &())
+}
+
+/// Remove the pairing; the device has to be put in pairing mode to be paired again
+fn forget(conn: &Connection, device: &OwnedObjectPath) -> zbus::Result<()> {
+    let adapter = find_adapter(conn)?.ok_or_else(|| zbus::Error::Failure("no powered adapter".into()))?;
+    let adapter = Proxy::new(conn, "org.bluez", adapter, "org.bluez.Adapter1")?;
+    let device = ObjectPath::try_from(device.as_str())?;
+    adapter.call::<_, _, ()>("RemoveDevice", &(&device,))
 }
