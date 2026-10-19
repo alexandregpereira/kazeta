@@ -1,0 +1,36 @@
+# Overrides /usr/share/inputplumber/devices/60-xbox_one_bt_gamepad.yaml, which still loads after this
+# file (same name, loaded first) but finds both devices already taken.
+# Upstream reads the input from the controller's hidraw device and only uses the event device for
+# rumble, but with newer firmware (Bluetooth name "Xbox Wireless Controller <suffix>") the hidraw
+# driver delivers no input. Here the kernel's event device gives the input and rumble, with its
+# own capability map (capability_maps.d/xbox_bt_evdev.yaml: right stick on ABS_Z/ABS_RZ, triggers
+# on ABS_BRAKE/ABS_GAS), and the hidraw device is only claimed so the upstream config cannot make
+# a second virtual gamepad of it.
+version: 1
+kind: CompositeDevice
+name: Microsoft X-Box One pad
+matches: []
+maximum_sources: 2
+source_devices:
+  - group: gamepad
+    udev:
+      attributes:
+        - name: name
+          value: "Xbox Wireless Controller*"
+      properties:
+        - name: ID_BUS
+          value: bluetooth
+      sys_name: "event*"
+      subsystem: input
+    capability_map_id: xbox_bt_evdev
+  - group: gamepad
+    udev:
+      driver: microsoft
+      subsystem: hidraw
+    events:
+      exclude:
+        - "*"
+target_devices:
+  - xbox-series
+  - mouse
+  - keyboard
