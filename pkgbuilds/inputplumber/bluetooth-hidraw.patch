@@ -1,0 +1,66 @@
+diff --git a/src/input/manager.rs b/src/input/manager.rs
+index 2c55128..4e52d57 100644
+--- a/src/input/manager.rs
++++ b/src/input/manager.rs
+@@ -1362,6 +1362,7 @@ impl Manager {
+ 
+     /// Called when a new device is detected by udev
+     async fn on_udev_device_added(&mut self, device: UdevDevice) -> Result<(), Box<dyn Error>> {
++        let device = refresh_incomplete_bluetooth_hidraw(device).await;
+         let dev_path = device.devpath();
+         let dev_name = device.name();
+         let dev_sysname = device.sysname();
+@@ -1497,6 +1498,15 @@ impl Manager {
+                         break 'check_manage;
+                     }
+ 
++                    // BlueZ creates Bluetooth HID devices through uhid, with the
++                    // Bluetooth bus (0005) in their HID id. Their address (uniq),
++                    // which the check below needs, may not be set yet when the
++                    // hidraw device shows up, so use the bus, as for event devices.
++                    if dev_path.contains("/uhid/0005:") {
++                        log::debug!("{dev_name} ({dev_sysname}) is a virtual device node for a bluetooth HID device. Treating as real - {dev_path}");
++                        break 'check_manage;
++                    }
++
+                     // Check to see if this virtual device is a bluetooth device
+                     let uniq = device.uniq();
+                     if uniq.is_empty() {
+@@ -1987,3 +1997,37 @@ impl Manager {
+         });
+     }
+ }
++
++/// The hidraw device of a Bluetooth controller (created by BlueZ through uhid, with the Bluetooth
++/// bus 0005 in its HID id) can be reported before udev knows its name and IDs, and the device
++/// keeps the values it was reported with, so no config would ever match it. Read it again from
++/// sysfs for a moment until its IDs are there.
++async fn refresh_incomplete_bluetooth_hidraw(device: UdevDevice) -> UdevDevice {
++    const ATTEMPTS: u32 = 20;
++    const INTERVAL: Duration = Duration::from_millis(50);
++    if device.subsystem() != "hidraw"
++        || !device.devpath().contains("/uhid/0005:")
++        || device.id_vendor() != 0
++    {
++        return device;
++    }
++    let syspath = device.syspath();
++    for _ in 0..ATTEMPTS {
++        tokio::time::sleep(INTERVAL).await;
++        let Ok(udev_device) = ::udev::Device::from_syspath(std::path::Path::new(&syspath)) else {
++            continue;
++        };
++        let refreshed = UdevDevice::from(udev_device);
++        if refreshed.id_vendor() != 0 {
++            log::debug!(
++                "Bluetooth hidraw device {} was reported incomplete, read it again: {}",
++                refreshed.sysname(),
++                refreshed.name()
++            );
++            return refreshed;
++        }
++    }
++    log::warn!("Bluetooth hidraw device at {syspath} is still incomplete");
++    device
++}
++

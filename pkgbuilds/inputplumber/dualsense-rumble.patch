@@ -1,15 +1,21 @@
 diff --git a/src/input/source/hidraw/dualsense.rs b/src/input/source/hidraw/dualsense.rs
-index 7b05c19..348c987 100644
+index 7b05c19..fe94f51 100644
 --- a/src/input/source/hidraw/dualsense.rs
 +++ b/src/input/source/hidraw/dualsense.rs
-@@ -1,5 +1,5 @@
+@@ -1,8 +1,11 @@
  use std::fmt::Debug;
 -use std::time::Instant;
 +use std::time::{Duration, Instant};
  use std::{collections::HashMap, error::Error};
  
  use evdev::{FFEffectData, FFEffectKind};
-@@ -93,6 +93,7 @@ impl DualSenseController {
++
++/// Share of the DualSense rumble range used at full magnitude
++const RUMBLE_STRENGTH_PERCENT: u32 = 70;
+ use packed_struct::types::SizedInteger;
+ 
+ use crate::drivers::dualsense::{
+@@ -93,6 +96,7 @@ impl DualSenseController {
          // The value determines if the effect should be playing or not.
          if value == 0 {
              log::trace!("Stopping rumble");
@@ -17,7 +23,7 @@ index 7b05c19..348c987 100644
              if let Err(e) = self.driver.rumble(0, 0) {
                  log::debug!("Failed to stop rumble: {:?}", e);
                  return Ok(());
-@@ -101,7 +102,6 @@ impl DualSenseController {
+@@ -101,7 +105,6 @@ impl DualSenseController {
          }
  
          // Perform the rumble based on the effect
@@ -25,7 +31,7 @@ index 7b05c19..348c987 100644
          match effect_data.kind {
              FFEffectKind::Damper => (),
              FFEffectKind::Inertia => (),
-@@ -128,15 +128,25 @@ impl DualSenseController {
+@@ -128,15 +131,30 @@ impl DualSenseController {
                  strong_magnitude,
                  weak_magnitude,
              } => {
@@ -33,9 +39,14 @@ index 7b05c19..348c987 100644
 -                let left_speed = strong_magnitude / u8::MAX as u16 + 1;
 -                let right_speed = weak_magnitude / u8::MAX as u16 + 1;
 +                // Scale the rumble values to the DS5 values, so a zero
-+                // magnitude stops the motors
-+                let left_speed = (strong_magnitude >> 8) as u8;
-+                let right_speed = (weak_magnitude >> 8) as u8;
++                // magnitude stops the motors. The DualSense rumbles much
++                // harder than other gamepads at the same magnitude, so it
++                // gets RUMBLE_STRENGTH_PERCENT of the range.
++                let scale = |magnitude: u16| {
++                    (magnitude as u32 * RUMBLE_STRENGTH_PERCENT / 100 >> 8) as u8
++                };
++                let left_speed = scale(strong_magnitude);
++                let right_speed = scale(weak_magnitude);
  
                  // Do rumble
 -                if let Err(e) = self.driver.rumble(left_speed as u8, right_speed as u8) {

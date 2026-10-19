@@ -5,11 +5,19 @@
 # Arch Linux package with Kazeta patches on top:
 # - dualsense-rumble.patch: stop DualSense rumble when the effect length
 #   elapses and when the magnitude is zero (it kept vibrating long after games
-#   asked for a short rumble)
+#   asked for a short rumble), and use 70% of its range, since it rumbles much
+#   harder than other gamepads
+# - dualsense-bluetooth-output.patch: send the Bluetooth output report (report
+#   0x31 with a sequence number and CRC) to a DualSense connected over
+#   Bluetooth; it only sent the USB one, so rumble and LEDs did nothing
+# - bluetooth-hidraw.patch: the hidraw device of a Bluetooth controller can be
+#   reported before its address, name and IDs are known; take it by its bus
+#   (0005) and read it again until its IDs are there. A DualSense was otherwise
+#   sometimes a virtual gamepad without input
 
 pkgname=inputplumber
 pkgver=0.82.0
-pkgrel=1.1
+pkgrel=1.3
 pkgdesc="Open source input router and remapper daemon for Linux"
 arch=('x86_64')
 options=(!lto)
@@ -31,13 +39,19 @@ makedepends=(
   rust
 )
 source=("git+https://github.com/ShadowBlip/InputPlumber.git#tag=v${pkgver}"
-        dualsense-rumble.patch)
+        dualsense-rumble.patch
+        dualsense-bluetooth-output.patch
+        bluetooth-hidraw.patch)
 sha256sums=('7b2091ad0ea0839bce8dd42a028610c1877a63f18ad391da8d2210eb87e78558'
-            'f244984f292bc1261a88109d20deb4dd1741c9a4de5320cec9a006e3a68bd88a')
+            '2613eacef5d0503b1b319db847a2dbc655df723c96f509e2800f8e707eea3f67'
+            '3e3f8754c277049278c1bbe508d4fc4aa266653e5488ed3e621fb3ef46a8d77d'
+            '2d65d760a9475baf97ffe27a1968e979d3b54d7bd6c07204ceb569e15a05f94b')
 
 prepare() {
   cd "$srcdir/InputPlumber"
   patch -Np1 -i "$srcdir/dualsense-rumble.patch"
+  patch -Np1 -i "$srcdir/dualsense-bluetooth-output.patch"
+  patch -Np1 -i "$srcdir/bluetooth-hidraw.patch"
 }
 
 build() {
