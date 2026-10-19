@@ -1,0 +1,7 @@
+# Games and the bios only see InputPlumber's virtual gamepads (/devices/virtual/input).
+# InputPlumber hides the real controllers too, but only after they show up: a game that is already
+# running (SDL) opens the real one first, keeps it as player 1 and gets no input from it.
+# Hiding them from the start leaves them to InputPlumber, which runs as root.
+# Runs after 70-uaccess.rules and before 73-seat-late.rules, which applies the uaccess tag.
+SUBSYSTEM=="input", KERNEL=="event*|js*", ENV{ID_INPUT_JOYSTICK}=="1", DEVPATH!="/devices/virtual/input/*", MODE:="0600", GROUP:="root", TAG-="uaccess"
+SUBSYSTEM=="hidraw", MODE:="0600", GROUP:="root", TAG-="uaccess"
